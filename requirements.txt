@@ -1,0 +1,4 @@
+paramiko
+requests
+PySide6
+packaging

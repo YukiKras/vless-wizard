@@ -39,8 +39,19 @@ class SSHManager:
     def __init__(self):
         self.client = None
         self.sftp = None
+        self.host = None
+        self.port = 22
+        self.username = None
+        self.password = None
+        self.pkey_path = None
 
     def connect(self, host, port=22, username=None, password=None, pkey_path=None, timeout=10):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.pkey_path = pkey_path
+        
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         if pkey_path:
@@ -50,6 +61,42 @@ class SSHManager:
             self.client.connect(hostname=host, port=port, username=username, password=password, timeout=timeout)
         self.sftp = self.client.open_sftp()
         return True
+
+    def reconnect(self, timeout=10):
+        if not all([self.host, self.username]):
+            return False
+            
+        try:
+            self.close()
+            time.sleep(1)
+            return self.connect(self.host, self.port, self.username, self.password, self.pkey_path, timeout)
+        except Exception as e:
+            return False
+
+    def is_connected(self):
+        try:
+            if self.client and self.client.get_transport() and self.client.get_transport().is_active():
+                self.client.exec_command("echo test", timeout=5)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def ensure_connection(self, max_retries=3, retry_delay=2):
+        for attempt in range(max_retries):
+            if self.is_connected():
+                return True
+                
+            if attempt > 0:
+                time.sleep(retry_delay)
+                
+            try:
+                if self.reconnect():
+                    return True
+            except Exception as e:
+                print(f"Попытка переподключения {attempt + 1} не удалась: {e}")
+                
+        return False
 
     def close(self):
         try:
@@ -66,8 +113,9 @@ class SSHManager:
         self.sftp = None
 
     def exec_command_stream(self, command, callback_stdout=None, callback_stderr=None, timeout=None, get_pty=False, env=None):
-        if not self.client:
-            raise RuntimeError("SSH not connected")
+        if not self.ensure_connection():
+            raise RuntimeError("SSH соединение потеряно и не может быть восстановлено")
+            
         transport = self.client.get_transport()
         chan = transport.open_session()
         if get_pty:
@@ -95,8 +143,9 @@ class SSHManager:
         return chan
 
     def exec_command(self, command, timeout=30):
-        if not self.client:
-            raise RuntimeError("SSH not connected")
+        if not self.ensure_connection():
+            raise RuntimeError("SSH соединение потеряно и не может быть восстановлено")
+            
         stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
         out = stdout.read().decode(errors="ignore")
         err = stderr.read().decode(errors="ignore")
@@ -104,14 +153,20 @@ class SSHManager:
         return exit_status, out, err
 
     def upload_file(self, local_path, remote_path):
+        if not self.ensure_connection():
+            raise RuntimeError("SSH соединение потеряно и не может быть восстановлено")
+            
         if not self.sftp:
-            raise RuntimeError("SFTP not connected")
+            self.sftp = self.client.open_sftp()
         self.sftp.put(local_path, remote_path)
         self.exec_command(f"chmod +x {remote_path}")
 
     def download_file(self, remote_path, local_path):
+        if not self.ensure_connection():
+            raise RuntimeError("SSH соединение потеряно и не может быть восстановлено")
+            
         if not self.sftp:
-            raise RuntimeError("SFTP not connected")
+            self.sftp = self.client.open_sftp()
         self.sftp.get(remote_path, local_path)
 
 import re
@@ -214,6 +269,51 @@ def get_sni_whitelist(raw_url: str = "https://raw.githubusercontent.com/yukikras
             result.append(random.choice(hosts))
     random.shuffle(result)
     return result
+
+class SNIManager:
+    
+    def __init__(self):
+        self.used_sni = set()
+        self.available_sni = []
+        self.current_index = 0
+        
+    def load_available_sni(self):
+        if not self.available_sni:
+            self.available_sni = get_sni_whitelist()
+        
+        available = [sni for sni in self.available_sni if sni not in self.used_sni]
+        
+        if not available:
+            print("Все SNI были использованы, очищаем историю...")
+            self.used_sni.clear()
+            available = self.available_sni.copy()
+        
+        random.shuffle(available)
+        return available
+    
+    def get_next_sni(self):
+        available = self.load_available_sni()
+        
+        if not available:
+            return None
+            
+        if self.current_index >= len(available):
+            self.current_index = 0
+            
+        sni = available[self.current_index]
+        self.current_index += 1
+        return sni
+    
+    def mark_sni_used(self, sni):
+        if sni and sni not in self.used_sni:
+            self.used_sni.add(sni)
+    
+    def get_used_count(self):
+        return len(self.used_sni)
+    
+    def get_available_count(self):
+        available = self.load_available_sni()
+        return len(available)
 
 def test_vless_config_with_curl(vless_url, timeout=10):
     try:
@@ -323,18 +423,40 @@ class LogWindow(QPlainTextEdit):
         self.ensureCursorVisible()
 
 class BaseWizardPage(QWizardPage):
-    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow):
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager):
         super().__init__()
         self.ssh_mgr = ssh_mgr
         self.logger_sig = logger_sig
         self.log_window = log_window
+        self.sni_manager = sni_manager
 
     def log_message(self, message):
         self.logger_sig.new_line.emit(message)
 
+    def ensure_ssh_connection(self, max_retries=5, retry_delay=3):
+        for attempt in range(max_retries):
+            if self.ssh_mgr.is_connected():
+                return True
+                
+            if attempt == 0:
+                self.log_message(f"[SSH] Проверка соединения...")
+            else:
+                self.log_message(f"[SSH] Попытка восстановления {attempt}/{max_retries-1}...")
+                time.sleep(retry_delay)
+                
+            try:
+                if self.ssh_mgr.reconnect():
+                    self.log_message("[SSH] Соединение восстановлено!")
+                    return True
+            except Exception as e:
+                self.log_message(f"[SSH] Ошибка восстановления: {e}")
+                
+        self.log_message("[SSH] Не удалось восстановить соединение")
+        return False
+
 class PageSSH(BaseWizardPage):
-    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow):
-        super().__init__(ssh_mgr, logger_sig, log_window)
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager):
+        super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.setTitle("Шаг 1 — параметры SSH")
         self.setSubTitle("Введите данные для подключения к серверу по SSH")
         
@@ -440,8 +562,8 @@ class PageSSH(BaseWizardPage):
         return bool(self.host_input.text().strip() and self.user_input.text().strip())
 
 class PageInstallXUI(BaseWizardPage):
-    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow):
-        super().__init__(ssh_mgr, logger_sig, log_window)
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager):
+        super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.setTitle("Шаг 2 — проверка и установка 3x-ui")
         self.setSubTitle("Автоматическая проверка и установка 3x-ui панели")
         
@@ -551,6 +673,12 @@ class PageInstallXUI(BaseWizardPage):
         
         def _check_install():
             try:
+                if not self.ensure_ssh_connection():
+                    self.log_message("[SSH] Не удалось восстановить соединение для проверки 3x-ui")
+                    self.status_label.setText("Ошибка: SSH соединение потеряно")
+                    self.progress_bar.setVisible(False)
+                    return
+                    
                 if self.force_install:
                     self.log_message("[check] Принудительная переустановка...")
                     self.install_xui()
@@ -592,6 +720,12 @@ class PageInstallXUI(BaseWizardPage):
 
         remote_script = f"/tmp/3xinstall_{secrets.token_hex(4)}.sh"
         try:
+            if not self.ensure_ssh_connection():
+                self.log_message("[SSH] Не удалось восстановить соединение для установки")
+                self.status_label.setText("Ошибка: SSH соединение потеряно")
+                self.progress_bar.setVisible(False)
+                return
+                
             self.ssh_mgr.upload_file(str(script_path), remote_script)
             self.log_message(f"[install] Скрипт загружен на сервер: {remote_script}")
         except Exception as e:
@@ -608,6 +742,12 @@ class PageInstallXUI(BaseWizardPage):
             self.log_message("[ERR] " + line)
 
         try:
+            if not self.ensure_ssh_connection():
+                self.log_message("[SSH] Не удалось восстановить соединение для выполнения скрипта")
+                self.status_label.setText("Ошибка: SSH соединение потеряно")
+                self.progress_bar.setVisible(False)
+                return
+                
             cmd = f"bash {remote_script}"
             chan = self.ssh_mgr.exec_command_stream(cmd, 
                                               callback_stdout=stdout_cb, 
@@ -656,6 +796,10 @@ class PageInstallXUI(BaseWizardPage):
 
     def read_install_log(self):
         try:
+            if not self.ensure_ssh_connection():
+                self.log_message("[SSH] Не удалось восстановить соединение для чтения лога")
+                return
+                
             exit_code, out, err = self.ssh_mgr.exec_command("cat /tmp/xui_install.log 2>/dev/null || echo 'NO_LOG_FILE'")
             
             if "NO_LOG_FILE" not in out:
@@ -693,6 +837,10 @@ class PageInstallXUI(BaseWizardPage):
 
     def check_exported_variables(self):
         try:
+            if not self.ensure_ssh_connection():
+                self.log_message("[SSH] Не удалось восстановить соединение для проверки переменных")
+                return
+                
             cmd = "echo \"URL=$url; USERNAME=$username; PASSWORD=$password\""
             exit_code, out, err = self.ssh_mgr.exec_command(cmd)
             
@@ -752,11 +900,11 @@ class PageInstallXUI(BaseWizardPage):
         return self.installation_complete
 
 class PagePanelAuth(BaseWizardPage):
-    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, page_install: PageInstallXUI, log_window: LogWindow):
-        super().__init__(ssh_mgr, logger_sig, log_window)
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, page_install: PageInstallXUI, log_window: LogWindow, sni_manager: SNIManager):
+        super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.page_install = page_install
         self.setTitle("Шаг 3 — авторизация в 3x-ui панели")
-        self.setSubTitle("Введите данные для входа в 3x-ui панель")
+        self.setSubTitle("Введите данные для входа в 3x-ui панели")
         
         layout = QVBoxLayout()
         
@@ -818,28 +966,38 @@ class PagePanelAuth(BaseWizardPage):
         
         def _do_auth():
             try:
+                if not self.ensure_ssh_connection():
+                    error_msg[0] = "SSH соединение потеряно и не может быть восстановлено"
+                    return
+                    
                 parsed = urlparse(url)
                 hostname = parsed.hostname or "127.0.0.1"
                 port = parsed.port or (443 if parsed.scheme == 'https' else 80)
                 webpath = parsed.path.strip('/')
                 
+                use_https = parsed.scheme == 'https'
+                protocol = "https" if use_https else "http"
+                
                 self.panel_info = {
                     'port': port,
                     'webpath': webpath,
-                    'base_url': f"http://127.0.0.1:{port}" + (f"/{webpath}" if webpath else "")
+                    'base_url': f"{protocol}://127.0.0.1:{port}" + (f"/{webpath}" if webpath else ""),
+                    'use_https': use_https
                 }
                 
                 cookie_jar = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
-                login_url = f"http://127.0.0.1:{port}"
+                login_url = f"{protocol}://127.0.0.1:{port}"
                 if webpath:
                     login_url += f"/{webpath}"
                 login_url += "/login"
                 
                 login_json = json.dumps({"username": username, "password": password}).replace('"', '\\"')
                 
+                ssl_options = "-k" if use_https else ""
+                
                 cmd = (
                     f'COOKIE_JAR={cookie_jar} && '
-                    f'LOGIN_RESPONSE=$(curl -s -c "$COOKIE_JAR" -X POST "{login_url}" '
+                    f'LOGIN_RESPONSE=$(curl -s {ssl_options} -c "$COOKIE_JAR" -X POST "{login_url}" '
                     f'-H "Content-Type: application/json" -d "{login_json}") && '
                     f'echo "=== LOGIN RESPONSE ===" && '
                     f'echo "$LOGIN_RESPONSE" && '
@@ -853,7 +1011,8 @@ class PagePanelAuth(BaseWizardPage):
                 
                 self.log_message(f"[auth] Выполняем авторизацию:")
                 self.log_message(f"[auth] URL: {login_url}")
-                self.log_message(f"[auth] Команда: curl -s -c cookie_jar -X POST {login_url} -H 'Content-Type: application/json' -d '{{\"username\": \"{username}\", \"password\": \"***\"}}'")
+                self.log_message(f"[auth] Используем HTTPS: {use_https}")
+                self.log_message(f"[auth] Команда: curl -s {ssl_options} -c cookie_jar -X POST {login_url} -H 'Content-Type: application/json' -d '{{\"username\": \"{username}\", \"password\": \"***\"}}'")
                 
                 exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=30)
                 
@@ -866,6 +1025,9 @@ class PagePanelAuth(BaseWizardPage):
                     success[0] = False
                     error_msg[0] = "Неверные учетные данные или недоступна панель"
                     self.log_message("[auth] Ошибка авторизации")
+                    self.log_message(f"[auth] Вывод: {out}")
+                    if err:
+                        self.log_message(f"[auth] Ошибка: {err}")
                 
             except Exception as e:
                 success[0] = False
@@ -896,8 +1058,8 @@ class PagePanelAuth(BaseWizardPage):
         return True
 
 class PageInbound(BaseWizardPage):
-    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, page_auth: PagePanelAuth, log_window: LogWindow):
-        super().__init__(ssh_mgr, logger_sig, log_window)
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, page_auth: PagePanelAuth, log_window: LogWindow, sni_manager: SNIManager):
+        super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.page_auth = page_auth
         self.setTitle("Шаг 4 — настройка Vless")
         self.setSubTitle("Создание и настройка Vless Reality подключения с автоматическим подбором SNI")
@@ -907,6 +1069,9 @@ class PageInbound(BaseWizardPage):
         self.status_label = QLabel("Нажмите 'Начать настройку' для автоматической настройки Vless")
         self.start_btn = QPushButton("Начать настройку")
         self.start_btn.clicked.connect(self.start_configuration)
+        
+        self.sni_info_label = QLabel("")
+        self.sni_info_label.setWordWrap(True)
         
         self.vless_label = QLabel("VLESS конфигурация:")
         self.vless_display = QPlainTextEdit()
@@ -927,6 +1092,7 @@ class PageInbound(BaseWizardPage):
         
         layout.addWidget(self.status_label)
         layout.addWidget(self.start_btn)
+        layout.addWidget(self.sni_info_label)
         layout.addWidget(self.vless_label)
         layout.addWidget(self.vless_display)
         layout.addWidget(self.copy_btn)
@@ -938,15 +1104,14 @@ class PageInbound(BaseWizardPage):
         
         self.current_inbound_id = None
         self.generated_config = None
-        self.sni_list = []
-        self.current_sni_index = 0
         self.panel_info = None
         self.cookie_jar = None
         self.server_host = None
         self.existing_clients = []
+        self.current_sni = None
 
     def initializePage(self):
-        self.load_sni_list()
+        self.update_sni_info()
         self.panel_info = self.page_auth.get_panel_info()
         self.cookie_jar = self.panel_info.get('cookie_jar', '')
         
@@ -956,21 +1121,19 @@ class PageInbound(BaseWizardPage):
                 self.server_host = transport.getpeername()[0]
                 self.log_message(f"[info] IP сервера: {self.server_host}")
 
-    def load_sni_list(self):
-        self.log_message("[sni] Загрузка списка SNI...")
-        try:
-            self.sni_list = get_sni_whitelist()
-            self.log_message(f"[sni] Загружено {len(self.sni_list)} SNI доменов")
-        except Exception as e:
-            self.log_message(f"[sni error] {e}")
+    def update_sni_info(self):
+        used_count = self.sni_manager.get_used_count()
+        available_count = self.sni_manager.get_available_count()
+        self.sni_info_label.setText(f"Использовано SNI: {used_count}, Доступно: {available_count}")
 
     def get_next_sni(self):
-        if not self.sni_list:
-            self.load_sni_list()
-        if self.current_sni_index >= len(self.sni_list):
-            self.current_sni_index = 0
-        sni = self.sni_list[self.current_sni_index]
-        self.current_sni_index += 1
+        """Получает следующий SNI и помечает его как использованный"""
+        sni = self.sni_manager.get_next_sni()
+        if sni:
+            self.current_sni = sni
+            self.sni_manager.mark_sni_used(sni)
+            self.update_sni_info()
+            self.log_message(f"[sni] Используем SNI: {sni}")
         return sni
 
     def start_configuration(self):
@@ -982,8 +1145,16 @@ class PageInbound(BaseWizardPage):
     def check_existing_inbound(self):
         self.log_message("[check] Проверяем существующие inbound...")
         
+        if not self.ensure_ssh_connection():
+            self.status_label.setText("Ошибка: SSH соединение потеряно")
+            self.start_btn.setVisible(True)
+            return
+            
         base_url = self.panel_info['base_url']
-        cmd_list = f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
+        use_https = self.panel_info.get('use_https', False)
+        ssl_options = "-k" if use_https else ""
+        
+        cmd_list = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
         
         try:
             exit_code, out, err = self.ssh_mgr.exec_command(cmd_list)
@@ -1057,6 +1228,10 @@ class PageInbound(BaseWizardPage):
             return
         
         sni = self.get_next_sni()
+        if not sni:
+            self.status_label.setText("Ошибка: нет доступных SNI")
+            self.start_btn.setVisible(True)
+            return
         
         self.create_inbound_with_keys(priv_key, pub_key, sni)
 
@@ -1068,12 +1243,19 @@ class PageInbound(BaseWizardPage):
             return
         
         sni = self.get_next_sni()
+        if not sni:
+            self.status_label.setText("Ошибка: нет доступных SNI")
+            self.start_btn.setVisible(True)
+            return
         
         self.update_inbound_with_keys(priv_key, pub_key, sni)
 
     def get_keys(self):
         base_url = self.panel_info['base_url']
-        cmd_get_keys = f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
+        use_https = self.panel_info.get('use_https', False)
+        ssl_options = "-k" if use_https else ""
+        
+        cmd_get_keys = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
         
         self.log_message("[keys] Получаем ключи...")
         
@@ -1106,6 +1288,9 @@ class PageInbound(BaseWizardPage):
 
     def create_inbound_with_keys(self, priv_key, pub_key, sni):
         base_url = self.panel_info['base_url']
+        use_https = self.panel_info.get('use_https', False)
+        ssl_options = "-k" if use_https else ""
+        
         short_id = secrets.token_hex(8)
         client_id = str(uuid.uuid4())
         
@@ -1171,7 +1356,7 @@ class PageInbound(BaseWizardPage):
         sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
         
         cmd_add = (
-            f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
+            f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
             f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
             f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
         )
@@ -1201,6 +1386,9 @@ class PageInbound(BaseWizardPage):
 
     def update_inbound_with_keys(self, priv_key, pub_key, sni):
         base_url = self.panel_info['base_url']
+        use_https = self.panel_info.get('use_https', False)
+        ssl_options = "-k" if use_https else ""
+        
         short_id = secrets.token_hex(8)
         
         if self.existing_clients:
@@ -1276,7 +1464,7 @@ class PageInbound(BaseWizardPage):
         sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
         
         cmd_update = (
-            f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
+            f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
             f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
             f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
         )
@@ -1357,17 +1545,9 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-import sys
-import requests
-import webbrowser
-from packaging import version
-from PySide6.QtWidgets import QApplication, QMessageBox, QWizard
-
-# ======= Константы обновлений =======
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
-# ===================================
 
 def check_for_update(parent=None):
     """Проверяет наличие новой версии на GitHub."""
@@ -1396,8 +1576,6 @@ def check_for_update(parent=None):
         print(f"[update] Ошибка проверки обновлений: {e}")
     return False
 
-
-# ======= Твой класс визарда =======
 class XUIWizard(QWizard):
     def __init__(self):
         super().__init__()
@@ -1407,11 +1585,12 @@ class XUIWizard(QWizard):
         self.log_window = LogWindow()
         self.ssh_mgr = SSHManager()
         self.logger_sig = LoggerSignal()
+        self.sni_manager = SNIManager()
         
-        self.page_ssh = PageSSH(self.ssh_mgr, self.logger_sig, self.log_window)
-        self.page_install = PageInstallXUI(self.ssh_mgr, self.logger_sig, self.log_window)
-        self.page_auth = PagePanelAuth(self.ssh_mgr, self.logger_sig, self.page_install, self.log_window)
-        self.page_inbound = PageInbound(self.ssh_mgr, self.logger_sig, self.page_auth, self.log_window)
+        self.page_ssh = PageSSH(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
+        self.page_install = PageInstallXUI(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
+        self.page_auth = PagePanelAuth(self.ssh_mgr, self.logger_sig, self.page_install, self.log_window, self.sni_manager)
+        self.page_inbound = PageInbound(self.ssh_mgr, self.logger_sig, self.page_auth, self.log_window, self.sni_manager)
         
         self.addPage(self.page_ssh)
         self.addPage(self.page_install)
