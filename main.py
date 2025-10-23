@@ -1013,7 +1013,10 @@ class PageInbound(BaseWizardPage):
         self.log_message("[check] Проверяем существующие inbound...")
         
         base_url = self.panel_info['base_url']
-        cmd_list = f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
+        scheme = self.panel_info.get('scheme', 'http')
+        curl_ssl_option = "-k" if scheme == "https" else ""
+        
+        cmd_list = f'curl -s {curl_ssl_option} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
         
         try:
             exit_code, out, err = self.ssh_mgr.exec_command(cmd_list)
@@ -1103,7 +1106,10 @@ class PageInbound(BaseWizardPage):
 
     def get_keys(self):
         base_url = self.panel_info['base_url']
-        cmd_get_keys = f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
+        scheme = self.panel_info.get('scheme', 'http')
+        curl_ssl_option = "-k" if scheme == "https" else ""
+        
+        cmd_get_keys = f'curl -s {curl_ssl_option} -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
         
         self.log_message("[keys] Получаем ключи...")
         
@@ -1200,8 +1206,11 @@ class PageInbound(BaseWizardPage):
         stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
         sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
         
+        scheme = self.panel_info.get('scheme', 'http')
+        curl_ssl_option = "-k" if scheme == "https" else ""
+        
         cmd_add = (
-            f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
+            f'curl -s {curl_ssl_option} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
             f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
             f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
         )
@@ -1305,8 +1314,11 @@ class PageInbound(BaseWizardPage):
         stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
         sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
         
+        scheme = self.panel_info.get('scheme', 'http')
+        curl_ssl_option = "-k" if scheme == "https" else ""
+        
         cmd_update = (
-            f'curl -s -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
+            f'curl -s {curl_ssl_option} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
             f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
             f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
         )
