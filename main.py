@@ -207,11 +207,14 @@ def get_sni_whitelist(raw_url: str = "https://raw.githubusercontent.com/yukikras
         else:
             tld = host
         domain_groups.setdefault(tld, []).append(host)
-    import random
+    
+    # Собираем все хосты без повторений и перемешиваем весь список
     result = []
-    for tld, hosts in domain_groups.items():
-        if hosts:
-            result.append(random.choice(hosts))
+    for tld, hosts_list in domain_groups.items():
+        # Добавляем все хосты из группы (они уже уникальные благодаря filtered)
+        result.extend(hosts_list)
+    
+    import random
     random.shuffle(result)
     return result
 
