@@ -823,26 +823,37 @@ class PagePanelAuth(BaseWizardPage):
             try:
                 parsed = urlparse(url)
                 hostname = parsed.hostname or "127.0.0.1"
-                port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+                scheme = parsed.scheme if parsed.scheme in ('http', 'https') else 'http'
+                port = parsed.port or (443 if scheme == 'https' else 80)
                 webpath = parsed.path.strip('/')
                 
+                # Используем hostname из URL (может быть IP или домен)
+                # Если это локальный адрес (127.0.0.1/localhost), оставляем как есть
+                # Иначе используем указанный hostname
+                base_host = hostname
+                
                 self.panel_info = {
+                    'scheme': scheme,
+                    'hostname': hostname,
                     'port': port,
                     'webpath': webpath,
-                    'base_url': f"http://127.0.0.1:{port}" + (f"/{webpath}" if webpath else "")
+                    'base_url': f"{scheme}://{base_host}:{port}" + (f"/{webpath}" if webpath else "")
                 }
                 
                 cookie_jar = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
-                login_url = f"http://127.0.0.1:{port}"
+                login_url = f"{scheme}://{base_host}:{port}"
                 if webpath:
                     login_url += f"/{webpath}"
                 login_url += "/login"
                 
                 login_json = json.dumps({"username": username, "password": password}).replace('"', '\\"')
                 
+                # Добавляем параметр -k для игнорирования проверки SSL сертификата при HTTPS
+                curl_ssl_option = "-k" if scheme == "https" else ""
+                
                 cmd = (
                     f'COOKIE_JAR={cookie_jar} && '
-                    f'LOGIN_RESPONSE=$(curl -s -c "$COOKIE_JAR" -X POST "{login_url}" '
+                    f'LOGIN_RESPONSE=$(curl -s {curl_ssl_option} -c "$COOKIE_JAR" -X POST "{login_url}" '
                     f'-H "Content-Type: application/json" -d "{login_json}") && '
                     f'echo "=== LOGIN RESPONSE ===" && '
                     f'echo "$LOGIN_RESPONSE" && '
