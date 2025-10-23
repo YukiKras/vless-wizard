@@ -953,6 +953,7 @@ class PageInbound(BaseWizardPage):
         self.current_inbound_id = None
         self.generated_config = None
         self.sni_list = []
+        self.used_snis = set()
         self.current_sni_index = 0
         self.panel_info = None
         self.cookie_jar = None
@@ -961,6 +962,8 @@ class PageInbound(BaseWizardPage):
 
     def initializePage(self):
         self.load_sni_list()
+        # Сбрасываем трекинг использованных SNI при инициализации страницы
+        self.used_snis = set()
         self.panel_info = self.page_auth.get_panel_info()
         self.cookie_jar = self.panel_info.get('cookie_jar', '')
         
@@ -979,12 +982,25 @@ class PageInbound(BaseWizardPage):
             self.log_message(f"[sni error] {e}")
 
     def get_next_sni(self):
+        # Обновляем список SNI, если он пуст
         if not self.sni_list:
             self.load_sni_list()
-        if self.current_sni_index >= len(self.sni_list):
-            self.current_sni_index = 0
-        sni = self.sni_list[self.current_sni_index]
-        self.current_sni_index += 1
+
+        # Если все SNI уже использованы, очищаем трекинг и перемешиваем список
+        available = [s for s in self.sni_list if s not in self.used_snis]
+        if not available:
+            # сбрасываем использованные и пересоздаём доступный список
+            self.used_snis.clear()
+            available = list(self.sni_list)
+            random.shuffle(available)
+        # Если по-прежнему нет доступных SNI - возвращаем пустую строку
+        if not available:
+            self.log_message("[sni] Список SNI пуст, не удалось получить SNI")
+            return ""
+
+        # Выбираем первый доступный SNI и отмечаем как использованный
+        sni = available[0]
+        self.used_snis.add(sni)
         return sni
 
     def start_configuration(self):
