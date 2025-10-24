@@ -2,3 +2,5 @@ paramiko
 requests
 PySide6
 packaging
+cloudflarepycli
+pysocks

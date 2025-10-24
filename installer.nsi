@@ -17,10 +17,10 @@ RequestExecutionLevel admin
 !insertmacro MUI_PAGE_LICENSE "LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
 
-; Страница выбора компонентов (для ярлыка на рабочем столе)
+; Страница выбора компонентов (для ярлыков)
 !define MUI_PAGE_HEADER_TEXT "Выбор компонентов"
 !define MUI_PAGE_HEADER_SUBTEXT "Выберите дополнительные компоненты для установки."
-!define MUI_COMPONENTSPAGE_TEXT_TOP "Выберите, следует ли создавать ярлык на рабочем столе."
+!define MUI_COMPONENTSPAGE_TEXT_TOP "Выберите дополнительные ярлыки для создания."
 !define MUI_COMPONENTSPAGE_TEXT_COMPLIST "Дополнительные компоненты:"
 !insertmacro MUI_PAGE_COMPONENTS
 
@@ -40,14 +40,21 @@ RequestExecutionLevel admin
 ShowInstDetails show
 ShowUnInstDetails show
 
-; Секция установки (обязательная)
+; Секции
 Section "Vless Wizard" SecMain
     SectionIn RO
+    
+    ; Проверка и удаление предыдущей установки
+    Call CheckAndRemovePreviousInstall
     
     SetOutPath "$INSTDIR"
     
     ; Копирование файлов программы
     File /r "dist\*.*"
+    
+    ; Копирование папки xray
+    SetOutPath "$INSTDIR\xray"
+    File /r "xray\*.*"
     
     ; Создание записи в "Установка и удаление программ"
     WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VlessWizard" \
@@ -65,13 +72,17 @@ Section "Vless Wizard" SecMain
     WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VlessWizard" \
         "NoRepair" 1
     
-    ; Создание ярлыка в меню "Пуск"
+    ; Создание файла удаления
+    WriteUninstaller "$INSTDIR\uninstall.exe"
+SectionEnd
+
+; Секция ярлыка в меню "Пуск" (включена по умолчанию)
+Section "Ярлык в меню Пуск" SecStartMenu
+    SectionIn 1  ; Включено по умолчанию
+    
     CreateDirectory "$SMPROGRAMS\Vless Wizard"
     CreateShortCut "$SMPROGRAMS\Vless Wizard\Vless Wizard.lnk" "$INSTDIR\main.exe"
     CreateShortCut "$SMPROGRAMS\Vless Wizard\Удалить Vless Wizard.lnk" "$INSTDIR\uninstall.exe"
-    
-    ; Создание файла удаления
-    WriteUninstaller "$INSTDIR\uninstall.exe"
 SectionEnd
 
 ; Секция ярлыка на рабочем столе (опциональная)
@@ -79,21 +90,63 @@ Section "Ярлык на рабочем столе" SecDesktopShortcut
     CreateShortCut "$DESKTOP\Vless Wizard.lnk" "$INSTDIR\main.exe"
 SectionEnd
 
+; Секция запуска программы после установки (включена по умолчанию)
+Section "Запустить Vless Wizard" SecRunProgram
+    SectionIn 1  ; Включено по умолчанию
+SectionEnd
+
 ; Описание секций
-LangString DESC_SecMain ${LANG_RUSSIAN} "Основные файлы программы Vless Wizard."
+LangString DESC_SecMain ${LANG_RUSSIAN} "Основные файлы программы Vless Wizard, включая xray."
+LangString DESC_SecStartMenu ${LANG_RUSSIAN} "Создать ярлык в меню Пуск."
 LangString DESC_SecDesktopShortcut ${LANG_RUSSIAN} "Создать ярлык на рабочем столе."
+LangString DESC_SecRunProgram ${LANG_RUSSIAN} "Запустить Vless Wizard после завершения установки."
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} $(DESC_SecMain)
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecStartMenu} $(DESC_SecStartMenu)
     !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktopShortcut} $(DESC_SecDesktopShortcut)
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecRunProgram} $(DESC_SecRunProgram)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+; Функция проверки и удаления предыдущей установки
+Function CheckAndRemovePreviousInstall
+    ; Проверяем наличие установленной программы
+    ReadRegStr $0 HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\VlessWizard" "UninstallString"
+    StrCmp $0 "" done
+    
+    ; Если нашли предыдущую установку, спрашиваем пользователя
+    MessageBox MB_YESNO|MB_ICONQUESTION \
+        "Обнаружена предыдущая установка Vless Wizard.$\n$\nХотите удалить предыдущую версию перед установкой новой?" \
+        /SD IDYES IDNO done
+    
+    ; Выполняем удаление
+    ExecWait '$0 /S _?=$INSTDIR'
+    
+    ; Небольшая пауза для завершения удаления
+    Sleep 1000
+    
+    done:
+FunctionEnd
+
+; Функция, выполняемая после установки
+Function .onInstSuccess
+    ; Проверяем, выбрана ли секция запуска программы
+    SectionGetFlags ${SecRunProgram} $0
+    IntOp $0 $0 & ${SF_SELECTED}
+    IntCmp $0 ${SF_SELECTED} 0 no_run
+    
+    ; Запускаем программу
+    Exec "$INSTDIR\main.exe"
+    
+    no_run:
+FunctionEnd
 
 ; Секция удаления
 Section "Uninstall"
     ; Удаление файлов
     RMDir /r "$INSTDIR"
     
-    ; Удаление ярлыков
+    ; Удаление ярлыков из меню "Пуск"
     Delete "$SMPROGRAMS\Vless Wizard\Vless Wizard.lnk"
     Delete "$SMPROGRAMS\Vless Wizard\Удалить Vless Wizard.lnk"
     RMDir "$SMPROGRAMS\Vless Wizard"
@@ -108,4 +161,8 @@ SectionEnd
 Function .onInit
     ; Установка русского языка по умолчанию
     !insertmacro MUI_LANGDLL_DISPLAY
+    
+    ; Установка выбранных по умолчанию компонентов
+    SectionSetFlags ${SecStartMenu} 1
+    SectionSetFlags ${SecRunProgram} 1
 FunctionEnd
