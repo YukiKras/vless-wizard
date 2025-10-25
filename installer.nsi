@@ -3,7 +3,7 @@
 
 ; Настройки приложения
 Name "Vless Wizard"
-OutFile "VlessWizard_Setup.exe"
+OutFile "dist\VlessWizard_Setup.exe"
 InstallDir "$PROGRAMFILES\Vless Wizard"
 
 ; Запрос прав администратора

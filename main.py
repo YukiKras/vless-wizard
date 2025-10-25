@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QDialogButtonBox, QListWidget, QGroupBox, QWidget, QTabWidget, QDialog, QFrame,
     QRadioButton, QButtonGroup
 )
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, Signal, QThread, Slot, QTranslator, QLocale, QLibraryInfo
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, Signal, QThread, Slot, QTranslator, QLocale, QLibraryInfo, QMetaObject, Qt, Q_ARG
 from PySide6.QtGui import QClipboard, QTextCursor
 
 
@@ -668,8 +668,8 @@ class PageInstallXUI(BaseWizardPage):
             try:
                 if not self.ensure_ssh_connection():
                     self.log_message("[SSH] Не удалось восстановить соединение для проверки 3x-ui")
-                    self.status_label.setText("Ошибка: SSH соединение потеряно")
-                    self.progress_bar.setVisible(False)
+                    self.safe_update_status("Ошибка: SSH соединение потеряно")
+                    self.safe_hide_progress()
                     return
                     
                 if self.force_install:
@@ -684,22 +684,22 @@ class PageInstallXUI(BaseWizardPage):
                 else:
                     self.xui_installed = True
                     self.log_message(f"[check] x-ui найден: {out.strip()}")
-                    self.status_label.setText("3x-ui уже установлен")
-                    self.progress_bar.setVisible(False)
+                    self.safe_update_status("3x-ui уже установлен")
+                    self.safe_hide_progress()
                     self.installation_complete = True
-                    self.reinstall_btn.setVisible(True)
+                    self.safe_show_reinstall_btn()
                     self.completeChanged.emit()
                     
             except Exception as e:
                 self.log_message(f"[check error] {e}")
-                self.status_label.setText(f"Ошибка проверки: {e}")
-                self.progress_bar.setVisible(False)
+                self.safe_update_status(f"Ошибка проверки: {e}")
+                self.safe_hide_progress()
 
         t = threading.Thread(target=_check_install, daemon=True)
         t.start()
 
     def install_xui(self):
-        self.status_label.setText("Установка 3x-ui...")
+        self.safe_update_status("Установка 3x-ui...")
         self.log_message("[install] Начинаем установку 3x-ui...")
     
         script_path = resource_path("3xinstall.sh")
@@ -707,29 +707,29 @@ class PageInstallXUI(BaseWizardPage):
     
         if not script_path.exists():
             self.log_message("[install] Ошибка: файл 3xinstall.sh не найден")
-            self.status_label.setText("Ошибка: 3xinstall.sh не найден")
-            self.progress_bar.setVisible(False)
+            self.safe_update_status("Ошибка: 3xinstall.sh не найден")
+            self.safe_hide_progress()
             return
 
         remote_script = f"/tmp/3xinstall_{secrets.token_hex(4)}.sh"
         try:
             if not self.ensure_ssh_connection():
                 self.log_message("[SSH] Не удалось восстановить соединение для установки")
-                self.status_label.setText("Ошибка: SSH соединение потеряно")
-                self.progress_bar.setVisible(False)
+                self.safe_update_status("Ошибка: SSH соединение потеряно")
+                self.safe_hide_progress()
                 return
                 
             self.ssh_mgr.upload_file(str(script_path), remote_script)
             self.log_message(f"[install] Скрипт загружен на сервер: {remote_script}")
         except Exception as e:
             self.log_message(f"[install error] Не удалось загрузить скрипт: {e}")
-            self.status_label.setText("Ошибка загрузки скрипта")
-            self.progress_bar.setVisible(False)
+            self.safe_update_status("Ошибка загрузки скрипта")
+            self.safe_hide_progress()
             return
 
         def stdout_cb(line):
             self.log_message(line)
-            self.parse_credentials(line)
+            self.safe_parse_credentials(line)
 
         def stderr_cb(line):
             self.log_message("[ERR] " + line)
@@ -737,8 +737,8 @@ class PageInstallXUI(BaseWizardPage):
         try:
             if not self.ensure_ssh_connection():
                 self.log_message("[SSH] Не удалось восстановить соединение для выполнения скрипта")
-                self.status_label.setText("Ошибка: SSH соединение потеряно")
-                self.progress_bar.setVisible(False)
+                self.safe_update_status("Ошибка: SSH соединение потеряно")
+                self.safe_hide_progress()
                 return
                 
             cmd = f"bash {remote_script}"
@@ -759,33 +759,61 @@ class PageInstallXUI(BaseWizardPage):
             
         except Exception as e:
             self.log_message(f"[install error] {e}")
-            self.status_label.setText(f"Ошибка установки: {e}")
-            self.progress_bar.setVisible(False)
+            self.safe_update_status(f"Ошибка установки: {e}")
+            self.safe_hide_progress()
 
-    def parse_credentials(self, line):
-        line_lower = line.lower()
-        
-        if "http" in line_lower and ("://" in line or "panel" in line_lower):
-            urls = re.findall(r'https?://[^\s<>"\'{}|\\^`\[\]]+', line)
-            if urls and 'url' not in self.panel_credentials:
-                self.panel_credentials['url'] = urls[0]
-                self.log_message(f"[creds] Найден URL: {urls[0]}")
-        
-        if any(keyword in line_lower for keyword in ['username', 'user', 'логин', 'login']):
-            parts = re.split(r'[:=]', line, maxsplit=1)
-            if len(parts) > 1 and 'username' not in self.panel_credentials:
-                username = parts[1].strip()
-                if username and len(username) > 1:
-                    self.panel_credentials['username'] = username
-                    self.log_message(f"[creds] Найден username: {username}")
-        
-        if any(keyword in line_lower for keyword in ['password', 'pass', 'пароль']):
-            parts = re.split(r'[:=]', line, maxsplit=1)
-            if len(parts) > 1 and 'password' not in self.panel_credentials:
-                password = parts[1].strip()
-                if password and len(password) > 1:
-                    self.panel_credentials['password'] = password
-                    self.log_message(f"[creds] Найден password: {password}")
+    def safe_parse_credentials(self, line):
+        try:
+            clean_line = line.strip()
+            if not clean_line:
+                return
+                
+            line_lower = clean_line.lower()
+            
+            if "http" in line_lower and ("://" in clean_line or "panel" in line_lower):
+                try:
+                    urls = re.findall(r'https?://[^\s<>"\'{}|\\^`\[\]]+', clean_line)
+                    if urls and 'url' not in self.panel_credentials:
+                        url = urls[0].strip()
+                        if url and len(url) > 10:  # Минимальная проверка длины
+                            self.panel_credentials['url'] = url
+                            self.log_message(f"[creds] Найден URL: {url}")
+                except Exception as e:
+                    self.log_message(f"[creds error] Ошибка парсинга URL: {e}")
+            
+            username_keywords = ['username', 'user', 'логин', 'login']
+            if any(keyword in line_lower for keyword in username_keywords):
+                try:
+                    for separator in [':', '=', '-']:
+                        if separator in clean_line:
+                            parts = clean_line.split(separator, 1)
+                            if len(parts) > 1 and 'username' not in self.panel_credentials:
+                                username = parts[1].strip()
+                                if username and 1 < len(username) < 50 and not username.startswith('http'):
+                                    self.panel_credentials['username'] = username
+                                    self.log_message(f"[creds] Найден username: {username}")
+                                    break
+                except Exception as e:
+                    self.log_message(f"[creds error] Ошибка парсинга username: {e}")
+            
+            password_keywords = ['password', 'pass', 'пароль']
+            if any(keyword in line_lower for keyword in password_keywords):
+                try:
+                    for separator in [':', '=', '-']:
+                        if separator in clean_line:
+                            parts = clean_line.split(separator, 1)
+                            if len(parts) > 1 and 'password' not in self.panel_credentials:
+                                password = parts[1].strip()
+                                # Проверяем что это пароль (не пустой и разумной длины)
+                                if password and 3 < len(password) < 100 and not password.startswith('http'):
+                                    self.panel_credentials['password'] = password
+                                    self.log_message(f"[creds] Найден password: {'*' * len(password)}")
+                                    break
+                except Exception as e:
+                    self.log_message(f"[creds error] Ошибка парсинга password: {e}")
+                    
+        except Exception as e:
+            self.log_message(f"[parse critical error] {e}")
 
     def read_install_log(self):
         try:
@@ -800,27 +828,7 @@ class PageInstallXUI(BaseWizardPage):
                 lines = out.splitlines()
                 
                 for line in lines:
-                    if "http" in line.lower() and "панель" in line.lower():
-                        urls = re.findall(r'https?://[^\s<>"\'{}|\\^`\[\]]+', line)
-                        if urls and 'url' not in self.panel_credentials:
-                            self.panel_credentials['url'] = urls[0]
-                            self.log_message(f"[log] Найден URL из лога: {urls[0]}")
-                    
-                    if "логин:" in line.lower() or "login:" in line.lower():
-                        parts = line.split(":", 1)
-                        if len(parts) > 1 and 'username' not in self.panel_credentials:
-                            username = parts[1].strip()
-                            if username:
-                                self.panel_credentials['username'] = username
-                                self.log_message(f"[log] Найден username из лога: {username}")
-                    
-                    if "пароль:" in line.lower() or "password:" in line.lower():
-                        parts = line.split(":", 1)
-                        if len(parts) > 1 and 'password' not in self.panel_credentials:
-                            password = parts[1].strip()
-                            if password:
-                                self.panel_credentials['password'] = password
-                                self.log_message(f"[log] Найден password из лога: {password}")
+                    self.safe_parse_credentials(line)
             
             self.check_exported_variables()
             
@@ -834,25 +842,32 @@ class PageInstallXUI(BaseWizardPage):
                 self.log_message("[SSH] Не удалось восстановить соединение для проверки переменных")
                 return
                 
-            cmd = "echo \"URL=$url; USERNAME=$username; PASSWORD=$password\""
-            exit_code, out, err = self.ssh_mgr.exec_command(cmd)
+            commands = [
+                "echo \"URL=$url\"",
+                "echo \"USERNAME=$username\"", 
+                "echo \"PASSWORD=$password\""
+            ]
             
-            for line in out.splitlines():
-                if 'URL=' in line:
-                    match = re.search(r'URL=([^;]+)', line)
-                    if match and match.group(1).strip() and 'url' not in self.panel_credentials:
-                        self.panel_credentials['url'] = match.group(1).strip()
-                        self.log_message(f"[export] Найден URL: {self.panel_credentials['url']}")
-                if 'USERNAME=' in line:
-                    match = re.search(r'USERNAME=([^;]+)', line)
-                    if match and match.group(1).strip() and 'username' not in self.panel_credentials:
-                        self.panel_credentials['username'] = match.group(1).strip()
-                        self.log_message(f"[export] Найден username: {self.panel_credentials['username']}")
-                if 'PASSWORD=' in line:
-                    match = re.search(r'PASSWORD=([^;]+)', line)
-                    if match and match.group(1).strip() and 'password' not in self.panel_credentials:
-                        self.panel_credentials['password'] = match.group(1).strip()
-                        self.log_message(f"[export] Найден password: {self.panel_credentials['password']}")
+            for cmd in commands:
+                try:
+                    exit_code, out, err = self.ssh_mgr.exec_command(cmd)
+                    if 'URL=' in cmd and 'url' not in self.panel_credentials:
+                        match = re.search(r'URL=([^\s]+)', out)
+                        if match and match.group(1).strip() and match.group(1) != '$url':
+                            self.panel_credentials['url'] = match.group(1).strip()
+                            self.log_message(f"[export] Найден URL: {self.panel_credentials['url']}")
+                    elif 'USERNAME=' in cmd and 'username' not in self.panel_credentials:
+                        match = re.search(r'USERNAME=([^\s]+)', out)
+                        if match and match.group(1).strip() and match.group(1) != '$username':
+                            self.panel_credentials['username'] = match.group(1).strip()
+                            self.log_message(f"[export] Найден username: {self.panel_credentials['username']}")
+                    elif 'PASSWORD=' in cmd and 'password' not in self.panel_credentials:
+                        match = re.search(r'PASSWORD=([^\s]+)', out)
+                        if match and match.group(1).strip() and match.group(1) != '$password':
+                            self.panel_credentials['password'] = match.group(1).strip()
+                            self.log_message(f"[export] Найден password: {'*' * len(self.panel_credentials['password'])}")
+                except Exception as e:
+                    self.log_message(f"[export cmd error] {cmd}: {e}")
             
             self.finalize_installation()
             
@@ -863,7 +878,7 @@ class PageInstallXUI(BaseWizardPage):
     def finalize_installation(self):
         self.xui_installed = True
         self.installation_complete = True
-        self.progress_bar.setVisible(False)
+        self.safe_hide_progress()
         
         cred_text = "Установка 3x-ui завершена!\n\n"
         if self.panel_credentials:
@@ -878,13 +893,28 @@ class PageInstallXUI(BaseWizardPage):
             cred_text += "Учетные данные не найдены в выводе установки.\nПроверьте логи для получения информации.\n"
         
         cred_text += "\nСохраните эти данные для входа в панель!"
-        self.credentials_label.setText(cred_text)
-        self.status_label.setText("Установка завершена")
-        self.copy_btn.setVisible(True)
-        self.save_btn.setVisible(True)
-        self.reinstall_btn.setVisible(True)
+        self.safe_update_credentials_label(cred_text)
+        self.safe_update_status("Установка завершена")
+        self.safe_show_buttons()
         
         self.completeChanged.emit()
+
+    def safe_update_status(self, text):
+        QMetaObject.invokeMethod(self.status_label, "setText", Qt.QueuedConnection, Q_ARG(str, text))
+    
+    def safe_hide_progress(self):
+        QMetaObject.invokeMethod(self.progress_bar, "setVisible", Qt.QueuedConnection, Q_ARG(bool, False))
+    
+    def safe_update_credentials_label(self, text):
+        QMetaObject.invokeMethod(self.credentials_label, "setText", Qt.QueuedConnection, Q_ARG(str, text))
+    
+    def safe_show_buttons(self):
+        QMetaObject.invokeMethod(self.copy_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
+        QMetaObject.invokeMethod(self.save_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
+        QMetaObject.invokeMethod(self.reinstall_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
+    
+    def safe_show_reinstall_btn(self):
+        QMetaObject.invokeMethod(self.reinstall_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
 
     def get_credentials(self):
         return self.panel_credentials
@@ -2398,7 +2428,7 @@ class AutoTestWindow(QDialog):
         cursor.movePosition(QTextCursor.End)
         self.log_display.setTextCursor(cursor)
 
-CURRENT_VERSION = "1.0.2"
+CURRENT_VERSION = "1.0.3"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
