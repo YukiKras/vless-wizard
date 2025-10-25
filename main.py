@@ -637,15 +637,18 @@ class PageInstallXUI(BaseWizardPage):
                     
                     self.log_message(f"[save] Данные сохранены в {file_path}")
                 except Exception as e:
-                    QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {e}")
+                    QTimer.singleShot(0, lambda: QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить файл: {e}"))
 
     def force_reinstall(self):
+        QTimer.singleShot(0, self._show_reinstall_dialog)
+
+    def _show_reinstall_dialog(self):
         reply = QMessageBox.question(self, "Переустановка 3x-ui", 
                                    "Вы уверены, что хотите переустановить 3x-ui панель?\n\n"
                                    "Это может занять несколько минут.",
-                                   QMessageBox.Yes | QMessageBox.No)
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
-        if reply == QMessageBox.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.force_install = True
             self.installation_complete = False
             self.xui_installed = False
@@ -654,16 +657,20 @@ class PageInstallXUI(BaseWizardPage):
             self.copy_btn.setVisible(False)
             self.save_btn.setVisible(False)
             self.reinstall_btn.setVisible(False)
-            self.check_and_install_xui()
+            self.start_xui_installation()
 
     def initializePage(self):
         self.check_and_install_xui()
 
     def check_and_install_xui(self):
-        self.status_label.setText("Проверка 3x-ui...")
+        if self.force_install:
+            self.start_xui_installation()
+            return
+            
+        self.safe_update_status("Проверка 3x-ui...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
-        
+    
         def _check_install():
             try:
                 if not self.ensure_ssh_connection():
@@ -671,16 +678,22 @@ class PageInstallXUI(BaseWizardPage):
                     self.safe_update_status("Ошибка: SSH соединение потеряно")
                     self.safe_hide_progress()
                     return
-                    
-                if self.force_install:
-                    self.log_message("[check] Принудительная переустановка...")
-                    self.install_xui()
-                    return
-                    
-                code, out, err = self.ssh_mgr.exec_command("command -v x-ui || which x-ui || echo '__XUI_NOT_FOUND__'")
+    
+                try:
+                    code, out, err = self.ssh_mgr.exec_command("command -v x-ui || which x-ui || echo '__XUI_NOT_FOUND__'")
+                except Exception as e:
+                    if "10054" in str(e) or "удаленный хост" in str(e).lower():
+                        self.log_message("[SSH] Соединение разорвано, пробуем переподключиться...")
+                        if not self.ensure_ssh_connection():
+                            self.safe_update_status("Ошибка: SSH соединение потеряно")
+                            self.safe_hide_progress()
+                            return
+                        code, out, err = self.ssh_mgr.exec_command("command -v x-ui || which x-ui || echo '__XUI_NOT_FOUND__'")
+                    else:
+                        raise
+    
                 if "__XUI_NOT_FOUND__" in out or not out.strip():
-                    self.log_message("[check] x-ui не найден, начинаем установку...")
-                    self.install_xui()
+                    self.safe_show_install_dialog()
                 else:
                     self.xui_installed = True
                     self.log_message(f"[check] x-ui найден: {out.strip()}")
@@ -689,78 +702,103 @@ class PageInstallXUI(BaseWizardPage):
                     self.installation_complete = True
                     self.safe_show_reinstall_btn()
                     self.completeChanged.emit()
-                    
+    
             except Exception as e:
                 self.log_message(f"[check error] {e}")
                 self.safe_update_status(f"Ошибка проверки: {e}")
                 self.safe_hide_progress()
-
+    
         t = threading.Thread(target=_check_install, daemon=True)
         t.start()
+
+    def start_xui_installation(self):
+        """Запуск установки 3x-ui (используется при обычной установке и принудительной переустановке)"""
+        self.log_message("[install] Начинаем установку 3x-ui...")
+        self.safe_update_status("Запуск установки 3x-ui...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        
+        self.force_install = False
+        
+        t = threading.Thread(target=self.install_xui, daemon=True)
+        t.start()
+
+    def safe_show_install_dialog(self):
+        QMetaObject.invokeMethod(self, "_show_install_dialog_impl")
+
+    @Slot()
+    def _show_install_dialog_impl(self):
+        ret = QMessageBox.question(
+            self, "Установка 3x-ui",
+            "3x-ui панель не обнаружена.\n\nОна будет установлена автоматически.\n\nПродолжить?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if ret != QMessageBox.StandardButton.Yes:
+            self.log_message("[check] Пользователь отказался от установки 3x-ui. Мастер завершает работу.")
+            self.safe_update_status("Установка отменена пользователем")
+            self.safe_hide_progress()
+            self.installation_complete = True
+            self.completeChanged.emit()
+            return
+        
+        self.start_xui_installation()
 
     def install_xui(self):
         self.safe_update_status("Установка 3x-ui...")
         self.log_message("[install] Начинаем установку 3x-ui...")
     
         script_path = resource_path("3xinstall.sh")
-        self.log_message(f"[install] Путь к скрипту: {script_path}")
-    
         if not script_path.exists():
             self.log_message("[install] Ошибка: файл 3xinstall.sh не найден")
             self.safe_update_status("Ошибка: 3xinstall.sh не найден")
             self.safe_hide_progress()
             return
-
+    
         remote_script = f"/tmp/3xinstall_{secrets.token_hex(4)}.sh"
-        try:
-            if not self.ensure_ssh_connection():
-                self.log_message("[SSH] Не удалось восстановить соединение для установки")
-                self.safe_update_status("Ошибка: SSH соединение потеряно")
-                self.safe_hide_progress()
-                return
-                
-            self.ssh_mgr.upload_file(str(script_path), remote_script)
-            self.log_message(f"[install] Скрипт загружен на сервер: {remote_script}")
-        except Exception as e:
-            self.log_message(f"[install error] Не удалось загрузить скрипт: {e}")
-            self.safe_update_status("Ошибка загрузки скрипта")
-            self.safe_hide_progress()
-            return
-
-        def stdout_cb(line):
-            self.log_message(line)
-            self.safe_parse_credentials(line)
-
-        def stderr_cb(line):
-            self.log_message("[ERR] " + line)
-
-        try:
-            if not self.ensure_ssh_connection():
-                self.log_message("[SSH] Не удалось восстановить соединение для выполнения скрипта")
-                self.safe_update_status("Ошибка: SSH соединение потеряно")
-                self.safe_hide_progress()
-                return
-                
-            cmd = f"bash {remote_script}"
-            chan = self.ssh_mgr.exec_command_stream(cmd, 
-                                              callback_stdout=stdout_cb, 
-                                              callback_stderr=stderr_cb, 
-                                              get_pty=True,
-                                              env={"OUTPUT_FILE": "/tmp/xui_install.log"})
-            
-            def _wait_install():
-                while not chan.exit_status_ready():
-                    time.sleep(0.5)
-                
-                self.read_install_log()
-                
-            t = threading.Thread(target=_wait_install, daemon=True)
-            t.start()
-            
-        except Exception as e:
-            self.log_message(f"[install error] {e}")
-            self.safe_update_status(f"Ошибка установки: {e}")
-            self.safe_hide_progress()
+        remote_log = f"/tmp/xui_install_{secrets.token_hex(4)}.log"
+    
+        self.ssh_mgr.upload_file(str(script_path), remote_script)
+    
+        exit_code, out, err = self.ssh_mgr.exec_command("command -v screen || echo 'NO_SCREEN'")
+        if "NO_SCREEN" in out:
+            self.ssh_mgr.exec_command("apt-get update && apt-get install -y screen || yum install -y screen")
+    
+        screen_name = f"xui_{secrets.token_hex(3)}"
+        self.ssh_mgr.exec_command(
+            f"screen -dmS {screen_name} bash -c 'bash {remote_script} > {remote_log} 2>&1; echo __XUI_DONE__ >> {remote_log}; exec bash'"
+        )
+    
+        def follow_log():
+            seen_lines = set()
+            done = False
+            while not done:
+                try:
+                    if not self.ensure_ssh_connection():
+                        self.log_message("[SSH] Соединение потеряно, переподключаемся...")
+                        time.sleep(2)
+                        continue
+    
+                    exit_code, out, err = self.ssh_mgr.exec_command(f"tail -n 50 {remote_log}")
+                    for line in out.splitlines():
+                        if line in seen_lines:
+                            continue
+                        seen_lines.add(line)
+                        self.safe_parse_credentials(line)
+                        self.log_message(line)
+                        if "__XUI_DONE__" in line:
+                            done = True
+                            break
+                    time.sleep(1)
+                except Exception as e:
+                    self.log_message(f"[install error] {e}")
+                    time.sleep(1)
+    
+            self.log_message("[install] Установка завершена, финализируем данные...")
+            self.finalize_installation()
+    
+        t = threading.Thread(target=follow_log, daemon=True)
+        t.start()
 
     def safe_parse_credentials(self, line):
         try:
@@ -775,7 +813,7 @@ class PageInstallXUI(BaseWizardPage):
                     urls = re.findall(r'https?://[^\s<>"\'{}|\\^`\[\]]+', clean_line)
                     if urls and 'url' not in self.panel_credentials:
                         url = urls[0].strip()
-                        if url and len(url) > 10:  # Минимальная проверка длины
+                        if url and len(url) > 10:
                             self.panel_credentials['url'] = url
                             self.log_message(f"[creds] Найден URL: {url}")
                 except Exception as e:
@@ -804,7 +842,6 @@ class PageInstallXUI(BaseWizardPage):
                             parts = clean_line.split(separator, 1)
                             if len(parts) > 1 and 'password' not in self.panel_credentials:
                                 password = parts[1].strip()
-                                # Проверяем что это пароль (не пустой и разумной длины)
                                 if password and 3 < len(password) < 100 and not password.startswith('http'):
                                     self.panel_credentials['password'] = password
                                     self.log_message(f"[creds] Найден password: {'*' * len(password)}")
@@ -900,21 +937,28 @@ class PageInstallXUI(BaseWizardPage):
         self.completeChanged.emit()
 
     def safe_update_status(self, text):
-        QMetaObject.invokeMethod(self.status_label, "setText", Qt.QueuedConnection, Q_ARG(str, text))
+        QMetaObject.invokeMethod(self.status_label, "setText", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(str, text))
     
     def safe_hide_progress(self):
-        QMetaObject.invokeMethod(self.progress_bar, "setVisible", Qt.QueuedConnection, Q_ARG(bool, False))
+        QMetaObject.invokeMethod(self.progress_bar, "setVisible", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(bool, False))
     
     def safe_update_credentials_label(self, text):
-        QMetaObject.invokeMethod(self.credentials_label, "setText", Qt.QueuedConnection, Q_ARG(str, text))
+        QMetaObject.invokeMethod(self.credentials_label, "setText", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(str, text))
     
     def safe_show_buttons(self):
-        QMetaObject.invokeMethod(self.copy_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
-        QMetaObject.invokeMethod(self.save_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
-        QMetaObject.invokeMethod(self.reinstall_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
+        QMetaObject.invokeMethod(self.copy_btn, "setVisible", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(bool, True))
+        QMetaObject.invokeMethod(self.save_btn, "setVisible", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(bool, True))
+        QMetaObject.invokeMethod(self.reinstall_btn, "setVisible", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(bool, True))
     
     def safe_show_reinstall_btn(self):
-        QMetaObject.invokeMethod(self.reinstall_btn, "setVisible", Qt.QueuedConnection, Q_ARG(bool, True))
+        QMetaObject.invokeMethod(self.reinstall_btn, "setVisible", Qt.ConnectionType.QueuedConnection, 
+                               Q_ARG(bool, True))
 
     def get_credentials(self):
         return self.panel_credentials
@@ -932,7 +976,7 @@ class PagePanelAuth(BaseWizardPage):
         layout = QVBoxLayout()
         
         self.panel_url_input = QLineEdit()
-        self.panel_url_input.setPlaceholderText("URL адрес панели 3x-ui")
+        self.panel_url_input.setPlaceholderText("URL адрес 3x-ui панели")
         
         self.username_input = QLineEdit()
         self.username_input.setPlaceholderText("Логин")
@@ -941,8 +985,17 @@ class PagePanelAuth(BaseWizardPage):
         self.password_input.setPlaceholderText("Пароль")
         self.password_input.setEchoMode(QLineEdit.Password)
         
-        self.status_label = QLabel("Предупреждение! Wizard на следующем шагу будет\nменять некоторые настройки в 3x-ui панели!\n\nЕсли у вас настроен 2FA аутенфикация в 3x-ui, пожалуйста, временно отключите его.")
+        self.status_label = QLabel()
         self.status_label.setWordWrap(True)
+        self.status_label.setText(
+            "Предупреждение! Wizard на следующему шагу будет<br>"
+            "менять некоторые настройки в 3x-ui панели!<br><br>"
+            "Если у вас настроена 2FA аутентификация в 3x-ui, пожалуйста, временно отключите её.<br><br>"
+            "В случае Aéza логин и пароль для 3x-ui панели можно найти следуя инструкциям "
+            "<a href='https://wiki.aeza.net/aezawiki/razvertyvanie-proksi-protokola-vless-s-pomoshyu-3x-ui#id-2.-vkhod-v-panel-3x-ui-i-sozdanie-klyucha-polzovatelya'>отсюда</a>."
+        )
+        self.status_label.setOpenExternalLinks(True)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         
@@ -1084,6 +1137,202 @@ class PagePanelAuth(BaseWizardPage):
 
     def isComplete(self):
         return True
+    
+    def nextId(self):
+        return 3
+
+class PageBackupPanel(BaseWizardPage):
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager):
+        super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
+        self.setTitle("Шаг 4 — резервная копия настроек 3x-ui")
+        self.setSubTitle("Рекомендуется сохранить резервную копию настроек перед продолжением")
+        
+        layout = QVBoxLayout()
+        
+        info_label = QLabel(
+            "Перед внесением изменений в настройки 3x-ui настоятельно рекомендуется\n"
+            "сохранить резервную копию всех настроек панели.\n\n"
+            "Резервная копия содержит все настройки пользователей, серверов и конфигураций."
+        )
+        info_label.setWordWrap(True)
+        
+        self.backup_button = QPushButton("Создать и сохранить резервную копию")
+        self.backup_button.clicked.connect(self.create_backup)
+        
+        self.status_label = QLabel("Нажмите кнопку для создания резервной копии")
+        self.status_label.setWordWrap(True)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        
+        self.file_path_label = QLabel("Файл не сохранен")
+        self.file_path_label.setWordWrap(True)
+        
+        layout.addWidget(info_label)
+        layout.addWidget(self.backup_button)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_bar)
+        layout.addWidget(QLabel("Сохраненный файл:"))
+        layout.addWidget(self.file_path_label)
+        
+        self.setLayout(layout)
+        
+        self.backup_data = None
+        self.backup_created = False
+        self.panel_info = {}
+
+    def initializePage(self):
+        wizard = self.wizard()
+        if wizard:
+            auth_page_id = wizard.currentId() - 1
+            auth_page = wizard.page(auth_page_id)
+            if hasattr(auth_page, 'get_panel_info'):
+                self.panel_info = auth_page.get_panel_info()
+                self.log_message(f"[backup] Получена информация о панели: {self.panel_info.get('base_url', 'unknown')}")
+            else:
+                self.log_message("[backup] Предыдущая страница не содержит информации о панели")
+                self.panel_info = {}
+        else:
+            self.panel_info = {}
+            
+        self.backup_created = False
+        self.backup_data = None
+        self.status_label.setText("Нажмите кнопку для создания резервной копии")
+        self.file_path_label.setText("Файл не сохранен")
+
+    def create_backup(self):
+        if not hasattr(self, 'panel_info') or not self.panel_info:
+            QMessageBox.warning(self, "Ошибка", "Информация о панели не найдена. Вернитесь на предыдущий шаг.")
+            return
+            
+        required_fields = ['base_url', 'cookie_jar', 'use_https']
+        for field in required_fields:
+            if field not in self.panel_info:
+                QMessageBox.warning(self, "Ошибка", f"Недостающая информация о панели: {field}")
+                return
+            
+        self.backup_button.setEnabled(False)
+        self.status_label.setText("Создание резервной копии...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        
+        success = [False]
+        error_msg = [None]
+        
+        def _do_backup():
+            try:
+                if not self.ensure_ssh_connection():
+                    error_msg[0] = "SSH соединение потеряно и не может быть восстановлено"
+                    return
+                    
+                backup_url = f"{self.panel_info['base_url']}/server/getDb"
+                
+                hostname = "127.0.0.1"
+                ssl_options = "-k" if self.panel_info.get('use_https', False) else ""
+                host_header = f'-H "Host: {hostname}"' if self.panel_info.get('use_https', False) else ""
+                cookie_jar = self.panel_info.get('cookie_jar', '')
+                
+                if not cookie_jar:
+                    error_msg[0] = "Файл cookies не найден"
+                    return
+                
+                cmd = (
+                    f'curl -s {ssl_options} -b "{cookie_jar}" "{backup_url}" '
+                    f'{host_header} -H "Accept: application/octet-stream"'
+                )
+                
+                self.log_message("[backup] Запрашиваем резервную копию базы данных")
+                self.log_message(f"[backup] URL: {backup_url}")
+                
+                exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=30)
+                
+                if exit_code == 0 and out:
+                    if len(out) > 100 and not out.startswith('<!DOCTYPE') and not out.startswith('<html'):
+                        success[0] = True
+                        self.backup_data = out
+                        self.log_message(f"[backup] Резервная копия получена успешно, размер: {len(out)} байт")
+                    else:
+                        success[0] = False
+                        error_msg[0] = "Получен некорректный ответ (возможно, требуется повторная авторизация)"
+                        self.log_message("[backup] Получен HTML вместо бинарных данных")
+                        if len(out) < 500:
+                            self.log_message(f"[backup] Ответ: {out[:200]}...")
+                else:
+                    success[0] = False
+                    error_msg[0] = f"Ошибка выполнения команды: {err}"
+                    self.log_message(f"[backup] Ошибка: exit_code={exit_code}, err={err}")
+                    
+            except Exception as e:
+                success[0] = False
+                error_msg[0] = str(e)
+                self.log_message(f"[backup error] {e}")
+        
+        t = threading.Thread(target=_do_backup, daemon=True)
+        t.start()
+        t.join(timeout=45)
+        
+        self.progress_bar.setVisible(False)
+        self.backup_button.setEnabled(True)
+        
+        if success[0] and self.backup_data:
+            self.backup_created = True
+            self.status_label.setText("Резервная копия успешно создана! Сохраняем файл...")
+            
+            self.save_backup_file()
+        else:
+            self.backup_created = False
+            self.status_label.setText(f"Ошибка создания резервной копии: {error_msg[0] or 'Таймаут'}")
+            QMessageBox.warning(self, "Ошибка", 
+                               f"Не удалось создать резервную копию:\n{error_msg[0] or 'Таймаут'}")
+
+    def save_backup_file(self):
+        if not self.backup_data:
+            QMessageBox.warning(self, "Ошибка", "Нет данных для сохранения")
+            return
+            
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"xui_backup_{timestamp}.db"
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить резервную копию 3x-ui",
+            default_filename,
+            "Database Files (*.db);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                if isinstance(self.backup_data, str):
+                    file_data = self.backup_data.encode('latin-1')
+                else:
+                    file_data = self.backup_data
+                
+                with open(file_path, 'wb') as f:
+                    f.write(file_data)
+                
+                self.file_path_label.setText(f"Файл сохранен: {file_path}")
+                self.status_label.setText("Резервная копия успешно сохранена!")
+                
+                file_size = os.path.getsize(file_path)
+                self.log_message(f"[backup] Файл сохранен: {file_path} ({file_size} байт)")
+                
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{str(e)}")
+                self.log_message(f"[backup error] Ошибка сохранения файла: {e}")
+        else:
+            self.backup_created = False
+            self.status_label.setText("Сохранение отменено")
+            self.file_path_label.setText("Файл не сохранен")
+
+    def validatePage(self):
+        return True
+
+    def isComplete(self):
+        return True
+
+    def nextId(self):
+        return self.wizard().currentId() + 1
 
 class TestWorker(QObject):
     finished = Signal()
@@ -1201,26 +1450,47 @@ class TestWorker(QObject):
                 self.finished.emit()
                 return
 
+            startupinfo = None
+            if os.name == 'nt':  # Windows
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0  # SW_HIDE
+
             xray_process = subprocess.Popen(
                 [xray_path, "run", "-config", temp_config.name],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
-                errors='ignore'
+                errors='ignore',
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
 
             def read_xray_output():
+                """Читаем вывод Xray, но не показываем его в логах тестирования"""
                 while xray_process and xray_process.poll() is None and self._is_running:
                     try:
                         line = xray_process.stdout.readline()
-                        if line:
-                            self.log_message.emit(f"Xray: {line.strip()}")
+                        if not line:
+                            break
                     except Exception:
                         break
 
             output_thread = threading.Thread(target=read_xray_output, daemon=True)
             output_thread.start()
+
+            def read_xray_errors():
+                while xray_process and xray_process.poll() is None and self._is_running:
+                    try:
+                        line = xray_process.stderr.readline()
+                        if not line:
+                            break
+                    except Exception:
+                        break
+
+            error_thread = threading.Thread(target=read_xray_errors, daemon=True)
+            error_thread.start()
 
             time.sleep(5)
 
@@ -1233,12 +1503,12 @@ class TestWorker(QObject):
                 self.finished.emit()
                 return
 
-            # Базовый URL тест
             test_cmd = [
                 "curl", 
                 "--socks5", "127.0.0.1:3080",
                 "--connect-timeout", "10",
                 "--max-time", "15",
+                "--silent",  # Добавляем silent режим
                 "http://cp.cloudflare.com/"
             ]
 
@@ -1250,7 +1520,9 @@ class TestWorker(QObject):
                     capture_output=True, 
                     text=True,
                     encoding='utf-8',
-                    errors='ignore'
+                    errors='ignore',
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
                 
                 ping_time = round((time.time() - start_time) * 1000)
@@ -1292,7 +1564,9 @@ class TestWorker(QObject):
                 else:
                     self.log_message.emit("URL тест: подключение не установлено")
                     if result.stderr:
-                        self.log_message.emit(f"Ошибка curl: {result.stderr.strip()}")
+                        error_msg = result.stderr.strip()
+                        if error_msg:
+                            self.log_message.emit(f"Ошибка curl: {error_msg}")
                     self.test_completed.emit({'success': False})
                     
             except subprocess.TimeoutExpired:
@@ -1309,11 +1583,13 @@ class TestWorker(QObject):
             self.test_completed.emit({'success': False})
         finally:
             try:
-                xray_process.terminate()
-                xray_process.wait(timeout=3)
+                if 'xray_process' in locals():
+                    xray_process.terminate()
+                    xray_process.wait(timeout=3)
             except:
                 try:
-                    xray_process.kill()
+                    if 'xray_process' in locals():
+                        xray_process.kill()
                 except:
                     pass
             
@@ -1326,18 +1602,14 @@ class TestWorker(QObject):
             self.finished.emit()
 
     def run_cloudflare_speedtest(self):
-        """Используем CloudflareSpeedtest для измерения скорости"""
         try:
-            # Настраиваем socks5 прокси
             socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 3080)
             socket.socket = socks.socksocket
             
             self.log_message.emit("Запуск теста скорости Cloudflare...")
             
-            # Создаем экземпляр CloudflareSpeedtest
             speedtest = CloudflareSpeedtest()
             
-            # Запускаем тест скорости
             self.log_message.emit("Измерение скорости скачивания...")
             download_speed = speedtest.download() / 1_000_000  # Конвертируем в Мбит/с
             
@@ -1355,11 +1627,9 @@ class TestWorker(QObject):
             return self.run_fallback_speedtest()
 
     def run_fallback_speedtest(self):
-        """Резервный метод тестирования скорости через загрузку файлов"""
         try:
             self.log_message.emit("Используем резервный метод тестирования...")
             
-            # Тест скачивания
             download_url = "https://cloudflare.com/cdn-cgi/trace"
             start_time = time.time()
             
@@ -1375,7 +1645,6 @@ class TestWorker(QObject):
             download_time = time.time() - start_time
             download_speed = (total_size * 8) / (download_time * 1_000_000) if download_time > 0 else 0
             
-            # Тест отдачи (упрощенный)
             upload_speed = download_speed * 0.8  # Предполагаем, что отдача на 20% медленнее
             
             return {
@@ -1418,7 +1687,7 @@ class PageInbound(BaseWizardPage):
     def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, page_auth: PagePanelAuth, log_window: LogWindow, sni_manager: SNIManager):
         super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.page_auth = page_auth
-        self.setTitle("Шаг 4 — настройка Vless")
+        self.setTitle("Шаг 5 — настройка Vless")
         self.setSubTitle("Автоматическая настройка Vless Reality подключения с подбором SNI")
         
         self.is_first_configuration = True
@@ -1428,10 +1697,19 @@ class PageInbound(BaseWizardPage):
         
         layout = QVBoxLayout()
         
+        self.info_label = QLabel(
+            "Инструкции по настройке и использованию VPN-приложений доступны "
+            "<a href='https://wiki.yukikras.net/ru/nastroikavpn'>здесь</a>."
+        )
+        self.info_label.setOpenExternalLinks(True)
+        
+        layout.addWidget(self.info_label)
+        
         self.status_label = QLabel("Настройка Vless Reality подключения")
         
         self.sni_info_label = QLabel("")
         self.sni_info_label.setWordWrap(True)
+        layout.addWidget(self.sni_info_label)
         
         self.vless_label = QLabel("VLESS конфигурация:")
         self.vless_display = QPlainTextEdit()
@@ -1486,7 +1764,6 @@ class PageInbound(BaseWizardPage):
         self.test_actions_layout.addWidget(self.not_work_btn)
         
         layout.addWidget(self.status_label)
-        layout.addWidget(self.sni_info_label)
         layout.addWidget(self.vless_label)
         layout.addWidget(self.vless_display)
         layout.addLayout(btn_layout1)
@@ -1674,12 +1951,19 @@ class PageInbound(BaseWizardPage):
             return []
 
     def handle_api_error(self, error_message):
-        reply = QMessageBox.question(self, "Ошибка API", 
-                                   f"Произошла ошибка при обращении к 3x-ui панели:\n\n{error_message}\n\n"
-                                   "Вероятнее всего используется не совместимая с утилитой версия 3x-ui панели.\n"
-                                   "Хотите переустановить 3x-ui панель?",
-                                   QMessageBox.Yes | QMessageBox.No)
-        
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Ошибка API")
+        msg_box.setTextFormat(Qt.TextFormat.RichText)
+        msg_box.setText(
+            f"Произошла ошибка при обращении к 3x-ui панели:<br><br>"
+            f"{error_message}<br><br>"
+            "Вероятнее всего используется не совместимая с утилитой версия 3x-ui панели.<br>"
+            "Подробнее об этой ошибки написано <a href='https://github.com/YukiKras/vless-wizard/wiki#%D0%BE%D1%88%D0%B8%D0%B1%D0%BA%D0%B0-api-%D1%87%D1%82%D0%BE-%D0%B4%D0%B5%D0%BB%D0%B0%D1%82%D1%8C'>в инструкции, в разделе FAQ</a>.<br><br>"
+            "Хотите переустановить 3x-ui панель?"
+        )
+        msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        msg_box.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        reply = msg_box.exec()
         if reply == QMessageBox.Yes:
             self.wizard().back()
             self.wizard().back()
@@ -2428,7 +2712,7 @@ class AutoTestWindow(QDialog):
         cursor.movePosition(QTextCursor.End)
         self.log_display.setTextCursor(cursor)
 
-CURRENT_VERSION = "1.0.3"
+CURRENT_VERSION = "1.0.4"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
@@ -2462,7 +2746,7 @@ class XUIWizard(QWizard):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vless Wizard")
-        self.resize(500, 500)
+        self.resize(558, 582)
         
         self.log_window = LogWindow()
         self.ssh_mgr = SSHManager()
@@ -2472,11 +2756,13 @@ class XUIWizard(QWizard):
         self.page_ssh = PageSSH(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
         self.page_install = PageInstallXUI(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
         self.page_auth = PagePanelAuth(self.ssh_mgr, self.logger_sig, self.page_install, self.log_window, self.sni_manager)
+        self.page_backup = PageBackupPanel(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
         self.page_inbound = PageInbound(self.ssh_mgr, self.logger_sig, self.page_auth, self.log_window, self.sni_manager)
         
         self.addPage(self.page_ssh)
         self.addPage(self.page_install)
         self.addPage(self.page_auth)
+        self.addPage(self.page_backup)
         self.addPage(self.page_inbound)
         
         self.setOption(QWizard.IndependentPages, False)

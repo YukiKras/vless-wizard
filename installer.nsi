@@ -50,7 +50,7 @@ Section "Vless Wizard" SecMain
     SetOutPath "$INSTDIR"
     
     ; Копирование файлов программы
-    File /r "dist\*.*"
+    File /r "dist\main.exe"
     
     ; Копирование папки xray
     SetOutPath "$INSTDIR\xray"
