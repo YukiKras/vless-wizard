@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+import io
 import json
 import uuid
 import time
@@ -12,7 +13,7 @@ import subprocess
 import random
 import socket
 import socks
-from cfspeedtest import CloudflareSpeedtest
+import qrcode
 import importlib.util
 from datetime import datetime
 from pathlib import Path
@@ -29,15 +30,23 @@ from PySide6.QtWidgets import (
     QProgressBar, QDialogButtonBox, QListWidget, QGroupBox, QWidget, QTabWidget, QDialog, QFrame,
     QRadioButton, QButtonGroup
 )
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, Signal, QThread, Slot, QTranslator, QLocale, QLibraryInfo, QMetaObject, Qt, Q_ARG
-from PySide6.QtGui import QClipboard, QTextCursor
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, Signal, QThread, Slot, QTranslator, QLocale, QLibraryInfo, QMetaObject, Qt, QEventLoop, Q_ARG
+from PySide6.QtGui import QClipboard, QTextCursor, QPixmap, QShortcut, QKeySequence
+
+if sys.stdout is None:
+    sys.stdout = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+if sys.stdin is None:
+    sys.stdin = io.TextIOWrapper(io.BytesIO(), encoding='utf-8')
+
+import speedtest
 
 
 def resource_path(relative_path: str) -> Path:
-    """Возвращает путь к ресурсу (совместимо с PyInstaller --onefile и --onedir)."""
-    if hasattr(sys, "_MEIPASS"):  # режим onefile
+    if hasattr(sys, "_MEIPASS"):
         base_path = Path(sys._MEIPASS)
-    else:  # режим onedir или IDE
+    else:
         base_path = Path(getattr(sys, 'frozen', False) and Path(sys.executable).parent or Path(__file__).parent)
     return base_path / relative_path
 
@@ -277,7 +286,6 @@ class SNIManager:
         available = [sni for sni in self.available_sni if sni not in self.used_sni]
         
         if not available:
-            print("Все SNI были использованы, очищаем историю...")
             self.used_sni.clear()
             available = self.available_sni.copy()
         
@@ -308,112 +316,88 @@ class SNIManager:
         available = self.load_available_sni()
         return len(available)
 
-def test_vless_config_with_curl(vless_url, timeout=10):
-    try:
-        parsed = urlparse(vless_url)
-        server_address = parsed.hostname
-        server_port = parsed.port or 443
-        user_id = parsed.username
-        query_params = parse_qs(parsed.query)
-        sni = query_params.get('sni', [''])[0]
-        public_key = query_params.get('pbk', [''])[0]
-        short_id = query_params.get('sid', [''])[0]
-
-        config = {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{
-                "port": 1080,
-                "listen": "127.0.0.1",
-                "protocol": "socks",
-                "settings": {"auth": "noauth", "udp": True}
-            }],
-            "outbounds": [{
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [{
-                        "address": server_address,
-                        "port": server_port,
-                        "users": [{"id": user_id, "encryption": "none"}]
-                    }]
-                },
-                "streamSettings": {
-                    "network": "tcp",
-                    "security": "reality",
-                    "realitySettings": {
-                        "serverName": sni,
-                        "publicKey": public_key,
-                        "shortId": short_id,
-                        "fingerprint": "chrome"
-                    }
-                }
-            }]
-        }
-
-        temp_config = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
-        json.dump(config, temp_config, indent=2)
-        temp_config.flush()
-        temp_config.close()
-
-        xray_path = Path("xray") / "xray.exe"
-        if not xray_path.exists():
-            xray_path = Path("xray.exe")
-            if not xray_path.exists():
-                return False, "xray.exe не найден"
-
-        process = subprocess.Popen(
-            [str(xray_path), "run", "-config", temp_config.name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        time.sleep(3)
-
-        test_cmd = [
-            "curl", "-s", "--socks5", "127.0.0.1:1080",
-            "--connect-timeout", str(timeout),
-            "--max-time", str(timeout),
-            "http://cp.cloudflare.com/"
-        ]
-
-        try:
-            result = subprocess.run(test_cmd, timeout=timeout+5, capture_output=True, text=True)
-            if result.returncode == 0:
-                return True, "Успешно подключено к cp.cloudflare.com"
-            else:
-                return False, f"Curl вернул код {result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
-        except subprocess.TimeoutExpired:
-            return False, "Таймаут при тестировании curl"
-        finally:
-            process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
-            try:
-                os.unlink(temp_config.name)
-            except:
-                pass
-
-    except Exception as e:
-        return False, f"Ошибка подготовки теста: {e}"
-
 class LoggerSignal(QObject):
     new_line = Signal(str)
 
-class LogWindow(QPlainTextEdit):
+class LogWindow(QTabWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Логи Vless Wizard")
-        self.setReadOnly(True)
+        self.setMinimumSize(700, 500)
+        
+        self.main_logs = QPlainTextEdit()
+        self.main_logs.setReadOnly(True)
+        
+        self.xray_logs = QPlainTextEdit()
+        self.xray_logs.setReadOnly(True)
+        
+        self.curl_logs = QPlainTextEdit()
+        self.curl_logs.setReadOnly(True)
+        
+        #self.speedtest_logs = QPlainTextEdit()
+        #self.speedtest_logs.setReadOnly(True)
+        
+        self.addTab(self.main_logs, "Основные логи")
+        self.addTab(self.xray_logs, "Логи Xray")
+        self.addTab(self.curl_logs, "Логи Curl")
+        #self.addTab(self.speedtest_logs, "Логи Speedtest")
+        
+    def append_main_log(self, line):
+        self.main_logs.appendPlainText(line)
+        self._scroll_to_end(self.main_logs)
+        
+    def append_xray_log(self, line):
+        self.xray_logs.appendPlainText(line)
+        self._scroll_to_end(self.xray_logs)
+        
+    def append_curl_log(self, line):
+        self.curl_logs.appendPlainText(line)
+        self._scroll_to_end(self.curl_logs)
+        
+    #def append_speedtest_log(self, line):
+    #    self.speedtest_logs.appendPlainText(line)
+    #    self._scroll_to_end(self.speedtest_logs)
+        
+    def _scroll_to_end(self, text_edit):
+        cursor = text_edit.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        text_edit.setTextCursor(cursor)
+        text_edit.ensureCursorVisible()
+    
+    def append_log(self, line):
+        self.append_main_log(line)
+
+class SpeedtestLogWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle("Логи Speedtest")
         self.setMinimumSize(600, 400)
         
-    def append_log(self, line):
-        self.appendPlainText(line)
-        cursor = self.textCursor()
+        layout = QVBoxLayout()
+        
+        self.log_display = QPlainTextEdit()
+        self.log_display.setReadOnly(True)
+        
+        clear_btn = QPushButton("Очистить логи")
+        clear_btn.clicked.connect(self.clear_logs)
+        
+        layout.addWidget(QLabel("Логи тестирования скорости:"))
+        layout.addWidget(self.log_display)
+        layout.addWidget(clear_btn)
+        
+        self.setLayout(layout)
+        
+    def append_log(self, message):
+        self.log_display.appendPlainText(f"{datetime.now().strftime('%H:%M:%S')} - {message}")
+        cursor = self.log_display.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
-        self.setTextCursor(cursor)
-        self.ensureCursorVisible()
+        self.log_display.setTextCursor(cursor)
+        
+    def clear_logs(self):
+        self.log_display.clear()
 
 class BaseWizardPage(QWizardPage):
     def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager):
@@ -481,6 +465,13 @@ class PageSSH(BaseWizardPage):
         layout.addWidget(QLabel("Пароль:"))
         layout.addWidget(self.pass_input)
         
+        help_label = QLabel(
+            'Если вы используете сервер от <b>Aeza</b>, то IP и пароль можно взять, '
+            'следуя <a href="https://github.com/YukiKras/vless-wizard/wiki#%D0%B2%D0%B2%D0%BE%D0%B4-%D0%BD%D0%B5%D0%BE%D0%B1%D1%85%D0%BE%D0%B4%D0%B8%D0%BC%D1%8B%D1%85-%D0%B4%D0%B0%D0%BD%D0%BD%D1%8B%D1%85-%D0%B4%D0%BE%D1%81%D1%82%D1%83%D0%BF%D0%B0">этой инструкции</a>.'
+        )
+        help_label.setOpenExternalLinks(True)
+        layout.addWidget(help_label)
+
         h = QHBoxLayout()
         h.addWidget(QLabel("Private key (опционально):"))
         h.addWidget(self.pkey_input)
@@ -1334,23 +1325,136 @@ class PageBackupPanel(BaseWizardPage):
     def nextId(self):
         return self.wizard().currentId() + 1
 
+class QRCodeWindow(QWidget):
+    def __init__(self, vless_config):
+        super().__init__()
+        self.vless_config = vless_config
+        self.init_ui()
+        
+    def init_ui(self):
+        self.setWindowTitle("QR Code - Vless Configuration")
+        self.setFixedSize(400, 450)
+        
+        layout = QVBoxLayout()
+        
+        title_label = QLabel("QR код Vless конфигурации")
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin: 10px;")
+        
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setMinimumSize(300, 300)
+        
+        self.config_display = QTextEdit()
+        self.config_display.setMaximumHeight(80)
+        self.config_display.setText(self.vless_config)
+        self.config_display.setReadOnly(True)
+        
+        btn_layout = QHBoxLayout()
+        save_btn = QPushButton("Сохранить QR код")
+        save_btn.clicked.connect(self.save_qr_code)
+        
+        btn_layout.addWidget(save_btn)
+        
+        layout.addWidget(title_label)
+        layout.addWidget(self.qr_label)
+        layout.addLayout(btn_layout)
+        
+        self.setLayout(layout)
+        self.generate_qr_code()
+        
+    def generate_qr_code(self):
+        try:
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=8,
+                border=2,
+            )
+            qr.add_data(self.vless_config)
+            qr.make(fit=True)
+            
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            qr_img = qr_img.resize((280, 280))
+            
+            img_data = io.BytesIO()
+            qr_img.save(img_data, format='PNG')
+            img_data = img_data.getvalue()
+            
+            pixmap = QPixmap()
+            pixmap.loadFromData(img_data)
+            self.qr_label.setPixmap(pixmap)
+            
+        except Exception as e:
+            self.qr_label.setText(f"Ошибка генерации QR: {e}")
+            
+    def copy_config(self):
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.vless_config)
+        
+    def save_qr_code(self):
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, 
+            "Сохранить QR код", 
+            "vless_qr_code.png", 
+            "PNG Images (*.png)"
+        )
+        
+        if file_path:
+            try:
+                qr = qrcode.QRCode(
+                    version=1,
+                    error_correction=qrcode.constants.ERROR_CORRECT_L,
+                    box_size=10,
+                    border=2,
+                )
+                qr.add_data(self.vless_config)
+                qr.make(fit=True)
+                
+                qr_img = qr.make_image(fill_color="black", back_color="white")
+                qr_img.save(file_path)
+                
+                QMessageBox.information(self, "Успех", f"QR код сохранен: {file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить: {e}")
+
 class TestWorker(QObject):
     finished = Signal()
     log_message = Signal(str)
     test_completed = Signal(dict)
+    xray_log = Signal(str)
+    curl_log = Signal(str)
+    speedtest_log = Signal(str)
     
     def __init__(self, generated_config, test_type):
         super().__init__()
         self.generated_config = generated_config
         self.test_type = test_type
         self._is_running = True
+        self.xray_process = None
+        self.temp_config = None
         
     def stop(self):
         self._is_running = False
+        if self.xray_process:
+            try:
+                self.xray_process.terminate()
+                self.xray_process.wait(timeout=3)
+            except:
+                try:
+                    self.xray_process.kill()
+                except:
+                    pass
         
     def run_test(self):
         try:
             self.log_message.emit("Начинаем тестирование конфигурации...")
+            
+            if not self.generated_config:
+                self.log_message.emit("Ошибка: нет конфигурации для тестирования")
+                self.test_completed.emit({'success': False, 'speed_ok': False})
+                self.finished.emit()
+                return
             
             vless_url = self.generated_config
             parsed = urlparse(vless_url)
@@ -1363,11 +1467,11 @@ class TestWorker(QObject):
             short_id = query_params.get('sid', [''])[0]
             flow = query_params.get('flow', [''])[0]
 
-            self.log_message.emit(f"Тестируем подключение к cloudflare.com с SNI: {sni}...")
+            self.log_message.emit(f"Тестируем подключение с SNI: {sni}...")
 
             config = {
                 "log": {
-                    "loglevel": "warning"
+                    "loglevel": "debug"
                 },
                 "inbounds": [
                     {
@@ -1438,26 +1542,26 @@ class TestWorker(QObject):
                 }
             }
 
-            temp_config = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
-            json.dump(config, temp_config, indent=2)
-            temp_config.flush()
-            temp_config.close()
+            self.temp_config = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
+            json.dump(config, self.temp_config, indent=2)
+            self.temp_config.flush()
+            self.temp_config.close()
 
             xray_path = self.find_xray()
             if not xray_path:
                 self.log_message.emit("Ошибка: xray не найден")
-                self.test_completed.emit({'success': False})
+                self.test_completed.emit({'success': False, 'speed_ok': False})
                 self.finished.emit()
                 return
 
             startupinfo = None
-            if os.name == 'nt':  # Windows
+            if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                startupinfo.wShowWindow = 0  # SW_HIDE
+                startupinfo.wShowWindow = 0
 
-            xray_process = subprocess.Popen(
-                [xray_path, "run", "-config", temp_config.name],
+            self.xray_process = subprocess.Popen(
+                [xray_path, "run", "-config", self.temp_config.name],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1468,12 +1572,13 @@ class TestWorker(QObject):
             )
 
             def read_xray_output():
-                """Читаем вывод Xray, но не показываем его в логах тестирования"""
-                while xray_process and xray_process.poll() is None and self._is_running:
+                while self.xray_process and self.xray_process.poll() is None and self._is_running:
                     try:
-                        line = xray_process.stdout.readline()
+                        line = self.xray_process.stdout.readline()
                         if not line:
                             break
+                        if line.strip():
+                            self.xray_log.emit(line.strip())
                     except Exception:
                         break
 
@@ -1481,180 +1586,185 @@ class TestWorker(QObject):
             output_thread.start()
 
             def read_xray_errors():
-                while xray_process and xray_process.poll() is None and self._is_running:
+                while self.xray_process and self.xray_process.poll() is None and self._is_running:
                     try:
-                        line = xray_process.stderr.readline()
+                        line = self.xray_process.stderr.readline()
                         if not line:
                             break
+                        if line.strip():
+                            self.xray_log.emit(f"STDERR: {line.strip()}")
                     except Exception:
                         break
 
             error_thread = threading.Thread(target=read_xray_errors, daemon=True)
             error_thread.start()
 
-            time.sleep(5)
+            time.sleep(3)
 
             if not self._is_running:
-                xray_process.terminate()
-                try:
-                    os.unlink(temp_config.name)
-                except:
-                    pass
+                self.cleanup()
                 self.finished.emit()
                 return
 
-            test_cmd = [
-                "curl", 
-                "--socks5", "127.0.0.1:3080",
-                "--connect-timeout", "10",
-                "--max-time", "15",
-                "--silent",  # Добавляем silent режим
-                "http://cp.cloudflare.com/"
-            ]
+            stats = {
+                'ping': 0,
+                'success': False,
+                'download': 0,
+                'upload': 0,
+                'speed_ok': False
+            }
 
-            start_time = time.time()
-            try:
-                result = subprocess.run(
-                    test_cmd, 
-                    timeout=20, 
-                    capture_output=True, 
-                    text=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    startupinfo=startupinfo,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-                )
-                
-                ping_time = round((time.time() - start_time) * 1000)
-                
-                if result.returncode == 0:
-                    self.log_message.emit("URL тест: http подключение успешно")
+            if self.test_type == "speed":
+                speed_result = self.run_speedtest()
+                if speed_result:
+                    download_speed = speed_result.get('download', 0)
+                    upload_speed = speed_result.get('upload', 0)
+                    ping = speed_result.get('ping', 0)
                     
-                    stats = {
-                        'ping': ping_time,
-                        'success': True,
-                        'download': 0,
-                        'upload': 0,
-                        'speed_ok': False
-                    }
+                    stats['ping'] = ping
+                    stats['download'] = download_speed
+                    stats['upload'] = upload_speed
+                    stats['speed_ok'] = download_speed > 10 and upload_speed > 10
+                    stats['success'] = True
                     
-                    if self.test_type == "speed":
-                        self.log_message.emit("Измеряем скорость через Cloudflare...")
-                        
-                        speed_result = self.run_cloudflare_speedtest()
-                        if speed_result:
-                            download_speed = speed_result.get('download', 0)
-                            upload_speed = speed_result.get('upload', 0)
-                            
-                            stats['download'] = download_speed
-                            stats['upload'] = upload_speed
-                            stats['speed_ok'] = download_speed > 10 and upload_speed > 10
-                            
-                            self.log_message.emit(f"Скорость скачивания: {download_speed:.2f} Мбит/с")
-                            self.log_message.emit(f"Скорость загрузки: {upload_speed:.2f} Мбит/с")
-                            
-                            if not stats['speed_ok']:
-                                self.log_message.emit("Скорость ниже нормы")
-                        else:
-                            self.log_message.emit("Ошибка измерения скорости")
+                    self.log_message.emit(f"Пинг: {ping:.2f} мс")
+                    self.log_message.emit(f"Скорость скачивания: {download_speed:.2f} Мбит/с")
+                    self.log_message.emit(f"Скорость загрузки: {upload_speed:.2f} Мбит/с")
+                    
+                    if stats['speed_ok']:
+                        self.log_message.emit("Скорость выше 10 Мбит/с в обе стороны - отлично!")
                     else:
-                        self.log_message.emit("URL тест завершен успешно")
-                    
-                    self.test_completed.emit(stats)
+                        if download_speed <= 10:
+                            self.log_message.emit(f"Скорость скачивания {download_speed:.2f} Мбит/с недостаточна")
+                        if upload_speed <= 10:
+                            self.log_message.emit(f"Скорость загрузки {upload_speed:.2f} Мбит/с недостаточна")
                 else:
-                    self.log_message.emit("URL тест: подключение не установлено")
-                    if result.stderr:
-                        error_msg = result.stderr.strip()
-                        if error_msg:
-                            self.log_message.emit(f"Ошибка curl: {error_msg}")
-                    self.test_completed.emit({'success': False})
+                    self.log_message.emit("Ошибка измерения скорости")
+                    stats['success'] = False
+            else:
+                test_cmd = [
+                    "curl", 
+                    "--socks5", "127.0.0.1:3080",
+                    "--connect-timeout", "10",
+                    "--max-time", "15",
+                    "--verbose",
+                    "http://cp.cloudflare.com/"
+                ]
+
+                start_time = time.time()
+                try:
+                    result = subprocess.run(
+                        test_cmd, 
+                        timeout=20, 
+                        capture_output=True, 
+                        text=True,
+                        encoding='utf-8',
+                        errors='ignore',
+                        startupinfo=startupinfo,
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                    )
                     
-            except subprocess.TimeoutExpired:
-                self.log_message.emit("URL тест: таймаут подключения")
-                self.test_completed.emit({'success': False})
-            except Exception as e:
-                self.log_message.emit(f"URL тест: ошибка подключения")
-                self.log_message.emit(f"Ошибка тестирования: {e}")
-                self.test_completed.emit({'success': False})
+                    if result.stderr:
+                        self.curl_log.emit(result.stderr)
+                    if result.stdout:
+                        self.curl_log.emit(result.stdout)
+                    
+                    ping_time = round((time.time() - start_time) * 1000)
+                    
+                    if result.returncode == 0:
+                        self.log_message.emit("URL тест: подключение успешно")
+                        stats['ping'] = ping_time
+                        stats['success'] = True
+                        self.log_message.emit("URL тест завершен успешно")
+                    else:
+                        self.log_message.emit("URL тест: подключение не установлено")
+                        stats['success'] = False
+                        
+                except subprocess.TimeoutExpired:
+                    self.log_message.emit("URL тест: таймаут подключения")
+                    stats['success'] = False
+                except Exception as e:
+                    self.log_message.emit(f"URL тест: ошибка подключения - {e}")
+                    stats['success'] = False
+
+            self.test_completed.emit(stats)
 
         except Exception as e:
-            self.log_message.emit("Критическая ошибка тестирования")
-            self.log_message.emit(f"Критическая ошибка: {e}")
-            self.test_completed.emit({'success': False})
+            self.log_message.emit(f"Критическая ошибка тестирования: {e}")
+            self.test_completed.emit({'success': False, 'speed_ok': False})
         finally:
-            try:
-                if 'xray_process' in locals():
-                    xray_process.terminate()
-                    xray_process.wait(timeout=3)
-            except:
-                try:
-                    if 'xray_process' in locals():
-                        xray_process.kill()
-                except:
-                    pass
-            
-            try:
-                if 'temp_config' in locals():
-                    os.unlink(temp_config.name)
-            except:
-                pass
-            
+            self.cleanup()
             self.finished.emit()
 
-    def run_cloudflare_speedtest(self):
+    def cleanup(self):
         try:
-            socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 3080)
-            socket.socket = socks.socksocket
-            
-            self.log_message.emit("Запуск теста скорости Cloudflare...")
-            
-            speedtest = CloudflareSpeedtest()
-            
-            self.log_message.emit("Измерение скорости скачивания...")
-            download_speed = speedtest.download() / 1_000_000  # Конвертируем в Мбит/с
-            
-            self.log_message.emit("Измерение скорости загрузки...")
-            upload_speed = speedtest.upload() / 1_000_000  # Конвертируем в Мбит/с
-            
-            return {
-                "download": download_speed,
-                "upload": upload_speed
-            }
-            
-        except Exception as e:
-            self.log_message.emit(f"Ошибка CloudflareSpeedtest: {e}")
-            # Если CloudflareSpeedtest не работает, используем fallback метод
-            return self.run_fallback_speedtest()
+            if self.xray_process:
+                self.xray_process.terminate()
+                try:
+                    self.xray_process.wait(timeout=3)
+                except:
+                    self.xray_process.kill()
+                self.xray_process = None
+        except:
+            pass
+        
+        try:
+            if self.temp_config:
+                os.unlink(self.temp_config.name)
+                self.temp_config = None
+        except:
+            pass
 
-    def run_fallback_speedtest(self):
+    def run_speedtest(self):
         try:
-            self.log_message.emit("Используем резервный метод тестирования...")
-            
-            download_url = "https://cloudflare.com/cdn-cgi/trace"
-            start_time = time.time()
-            
-            response = requests.get(download_url, timeout=30, stream=True)
-            total_size = 0
-            
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    total_size += len(chunk)
-                    if time.time() - start_time > 10:  # Максимум 10 секунд
-                        break
-            
-            download_time = time.time() - start_time
-            download_speed = (total_size * 8) / (download_time * 1_000_000) if download_time > 0 else 0
-            
-            upload_speed = download_speed * 0.8  # Предполагаем, что отдача на 20% медленнее
-            
+            self.speedtest_log.emit("=== НАЧАЛО ТЕСТА СКОРОСТИ ===")
+            self.speedtest_log.emit("Настраиваем SOCKS5 прокси для speedtest (127.0.0.1:3080)...")
+    
+            os.environ['ALL_PROXY'] = 'socks5://127.0.0.1:3080'
+            os.environ['HTTP_PROXY'] = 'socks5://127.0.0.1:3080'
+            os.environ['HTTPS_PROXY'] = 'socks5://127.0.0.1:3080'
+    
+            self.speedtest_log.emit("Создаем объект Speedtest...")
+            st = speedtest.Speedtest()
+    
+            self.speedtest_log.emit("Ищем лучший сервер...")
+            best = st.get_best_server()
+            ping = best.get('latency', 0) if best else 0
+            if best:
+                self.speedtest_log.emit(f"Найден сервер: {best.get('host')} ({best.get('sponsor')})")
+                self.speedtest_log.emit(f"Локация: {best.get('name', 'N/A')}, {best.get('country', 'N/A')}")
+            else:
+                self.speedtest_log.emit("Не удалось найти сервер")
+                return None
+    
+            self.speedtest_log.emit("Измеряем скорость СКАЧИВАНИЯ...")
+            download_bps = st.download()
+            download_mbps = download_bps / 1_000_000
+            self.speedtest_log.emit(f"Download: {download_mbps:.2f} Мбит/с")
+    
+            self.speedtest_log.emit("Измеряем скорость ЗАГРУЗКИ...")
+            upload_bps = st.upload(pre_allocate=False)
+            upload_mbps = upload_bps / 1_000_000
+            self.speedtest_log.emit(f"Upload: {upload_mbps:.2f} Мбит/с")
+    
+            self.speedtest_log.emit(f"Пинг: {ping:.2f} мс")
+            self.speedtest_log.emit("=== ТЕСТ ЗАВЕРШЕН ===")
+    
             return {
-                "download": download_speed,
-                "upload": upload_speed
+                "ping": ping,
+                "download": download_mbps,
+                "upload": upload_mbps
             }
-            
+    
         except Exception as e:
-            self.log_message.emit(f"Ошибка резервного теста: {e}")
+            self.speedtest_log.emit(f"Ошибка Speedtest: {e}")
+            import traceback
+            self.speedtest_log.emit(traceback.format_exc())
             return None
+        finally:
+            for var in ['ALL_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY']:
+                if var in os.environ:
+                    del os.environ[var]
 
     def find_xray(self):
         possible_paths = [
@@ -1682,9 +1792,10 @@ class TestWorker(QObject):
 class PageInbound(BaseWizardPage):
     test_log_signal = Signal(str)
     test_completed_signal = Signal(dict)
-    auto_test_log_signal = Signal(str)
+    xray_log_signal = Signal(str)
+    curl_log_signal = Signal(str)
     
-    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, page_auth: PagePanelAuth, log_window: LogWindow, sni_manager: SNIManager):
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager, page_auth):
         super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.page_auth = page_auth
         self.setTitle("Шаг 5 — настройка Vless")
@@ -1693,7 +1804,10 @@ class PageInbound(BaseWizardPage):
         self.is_first_configuration = True
         self.test_log_signal.connect(self.add_test_log)
         self.test_completed_signal.connect(self.on_test_completed)
-        self.auto_test_log_signal.connect(self.add_auto_test_log)
+        self.xray_log_signal.connect(self.log_window.append_xray_log)
+        self.curl_log_signal.connect(self.log_window.append_curl_log)
+        
+        self.speedtest_log_window = SpeedtestLogWindow()
         
         layout = QVBoxLayout()
         
@@ -1706,6 +1820,28 @@ class PageInbound(BaseWizardPage):
         layout.addWidget(self.info_label)
         
         self.status_label = QLabel("Настройка Vless Reality подключения")
+        layout.addWidget(self.status_label)
+        
+        auto_test_layout = QHBoxLayout()
+        auto_test_label = QLabel("Статус автоподбора:")
+        self.auto_test_status = QLabel("ОЖИДАНИЕ")
+        self.auto_test_status.setStyleSheet("""
+            QLabel {
+                padding: 4px 8px;
+                border-radius: 4px;
+                background-color: #6c757d;
+                color: white;
+                font-weight: bold;
+            }
+        """)
+        self.auto_test_status.setAlignment(Qt.AlignCenter)
+        self.auto_test_status.setMinimumWidth(120)
+        
+        auto_test_layout.addWidget(auto_test_label)
+        auto_test_layout.addWidget(self.auto_test_status)
+        auto_test_layout.addStretch()
+        
+        layout.addLayout(auto_test_layout)
         
         self.sni_info_label = QLabel("")
         self.sni_info_label.setWordWrap(True)
@@ -1720,15 +1856,19 @@ class PageInbound(BaseWizardPage):
         self.copy_btn = QPushButton("Скопировать")
         self.copy_btn.clicked.connect(self.copy_vless)
         
+        self.qr_btn = QPushButton("Показать QR код")
+        self.qr_btn.clicked.connect(self.show_qr_code)
+        
+        self.regenerate_btn = QPushButton("Сгенерировать ключ")
+        self.regenerate_btn.clicked.connect(self.regenerate_vless)
+        
         self.test_btn = QPushButton("Протестировать")
         self.test_btn.clicked.connect(self.test_vless_config)
         
-        #self.auto_test_btn = QPushButton("Автотестирование SNI")
-        #self.auto_test_btn.clicked.connect(self.show_auto_test_window)
-        
         btn_layout1.addWidget(self.copy_btn)
+        btn_layout1.addWidget(self.qr_btn)
+        btn_layout1.addWidget(self.regenerate_btn)
         btn_layout1.addWidget(self.test_btn)
-        #btn_layout1.addWidget(self.auto_test_btn)
         
         self.test_group = QGroupBox("Тестирование конфигурации")
         test_layout = QVBoxLayout(self.test_group)
@@ -1736,15 +1876,15 @@ class PageInbound(BaseWizardPage):
         test_options_layout = QHBoxLayout()
         self.test_type_group = QButtonGroup(self)
         
+        self.speed_test_radio = QRadioButton("Тест скорости")
+        self.speed_test_radio.setChecked(True)
         self.url_test_radio = QRadioButton("URL тест")
-        self.url_test_radio.setChecked(True)
-        #self.speed_test_radio = QRadioButton("Тест скорости")
         
+        self.test_type_group.addButton(self.speed_test_radio)
         self.test_type_group.addButton(self.url_test_radio)
-        #self.test_type_group.addButton(self.speed_test_radio)
         
+        test_options_layout.addWidget(self.speed_test_radio)
         test_options_layout.addWidget(self.url_test_radio)
-        #test_options_layout.addWidget(self.speed_test_radio)
         test_options_layout.addStretch()
         
         self.test_log_display = QPlainTextEdit()
@@ -1755,15 +1895,14 @@ class PageInbound(BaseWizardPage):
         test_layout.addWidget(self.test_log_display)
         
         self.test_actions_layout = QHBoxLayout()
-        self.work_btn = QPushButton("Работает - завершить работу мастера")
-        self.work_btn.clicked.connect(self.config_works)
+        #self.work_btn = QPushButton("Работает - завершить работу мастера")
+        #self.work_btn.clicked.connect(self.config_works)
         self.not_work_btn = QPushButton("Настроить (VPN) Vless")
-        self.not_work_btn.clicked.connect(self.config_not_works)
+        self.not_work_btn.clicked.connect(self.start_auto_configuration)
         
-        self.test_actions_layout.addWidget(self.work_btn)
+        #self.test_actions_layout.addWidget(self.work_btn)
         self.test_actions_layout.addWidget(self.not_work_btn)
         
-        layout.addWidget(self.status_label)
         layout.addWidget(self.vless_label)
         layout.addWidget(self.vless_display)
         layout.addLayout(btn_layout1)
@@ -1782,8 +1921,8 @@ class PageInbound(BaseWizardPage):
         self.test_thread = None
         self.test_worker = None
         self.testing_in_progress = False
-        self.auto_testing = False
-        self.auto_test_stop = False
+        self.auto_config_in_progress = False
+        self.auto_config_stop = False
         self.current_stats = {
             'ping': 0,
             'download': 0,
@@ -1791,26 +1930,540 @@ class PageInbound(BaseWizardPage):
             'success': False,
             'speed_ok': False
         }
-        self.hidden_logs = []
-        self.hidden_log_window = None
 
-    def update_inbound_sni(self):
-        self.log_message("Обновляем SNI у существующего inbound...")
-        priv_key, pub_key = self.get_keys()
-        if not priv_key or not pub_key:
-            return False
-        sni = self.get_next_sni()
-        if not sni:
-            self.status_label.setText("Ошибка: нет доступных SNI")
-            return False
+        self.setup_shortcuts()
+
+    def update_auto_test_status(self, status, color):
+        """Обновляет статус автотестирования с указанным цветом"""
+        status_texts = {
+            "waiting": "ОЖИДАНИЕ",
+            "testing": "ПОДБОР SNI",
+            "success": "УСПЕХ"
+        }
         
-        self.update_inbound_with_keys(priv_key, pub_key, sni)
-        return True
+        self.auto_test_status.setText(status_texts[status])
+        self.auto_test_status.setStyleSheet(f"""
+            QLabel {{
+                padding: 4px 8px;
+                border-radius: 4px;
+                background-color: {color};
+                color: white;
+                font-weight: bold;
+            }}
+        """)
+
+    def setup_shortcuts(self):
+        shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
+        shortcut.activated.connect(self.show_speedtest_logs)
+
+    def show_speedtest_logs(self):
+        self.speedtest_log_window.show()
+        self.speedtest_log_window.raise_()
+        self.speedtest_log_window.activateWindow()
+
+    def show_qr_code(self):
+        if self.generated_config:
+            self.qr_window = QRCodeWindow(self.generated_config)
+            self.qr_window.show()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Нет конфигурации для отображения QR кода")
+
+    def regenerate_vless(self):
+        if not self.panel_info:
+            QMessageBox.warning(self, "Ошибка", "Нет данных панели для генерации ключа")
+            return
+            
+        self.status_label.setText("Генерация нового Vless ключа...")
+        self.clear_test_log()
+        self.add_test_log("Генерируем новый Vless ключ...")
+        
+        threading.Thread(target=self._regenerate_vless_worker, daemon=True).start()
+
+    def _regenerate_vless_worker(self):
+        try:
+            priv_key, pub_key = self._get_keys()
+            if not priv_key or not pub_key:
+                self._emit_test_log("Не удалось получить ключи")
+                return
+                
+            sni = self.get_next_sni()
+            if not sni:
+                self._emit_test_log("Нет доступных SNI")
+                return
+                
+            if self.current_inbound_id:
+                success = self._update_inbound_with_keys(priv_key, pub_key, sni)
+            else:
+                success = self._create_inbound_with_keys(priv_key, pub_key, sni)
+                
+            if success:
+                self._emit_test_log("Vless ключ успешно сгенерирован")
+                QMetaObject.invokeMethod(self, "_update_status_success", 
+                                       Qt.QueuedConnection,
+                                       Q_ARG(str, "Vless ключ сгенерирован"))
+            else:
+                self._emit_test_log("Ошибка генерации Vless ключа")
+                
+        except Exception as e:
+            self._emit_test_log(f"Ошибка генерации: {e}")
+
+    @Slot(str)
+    def _update_status_success(self, message):
+        self.status_label.setText(message)
+
+    @Slot(str)
+    def add_test_log(self, message):
+        current_text = self.test_log_display.toPlainText()
+        new_text = current_text + f"{datetime.now().strftime('%H:%M:%S')} - {message}\n"
+        self.test_log_display.setPlainText(new_text)
+        cursor = self.test_log_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.test_log_display.setTextCursor(cursor)
+
+    def clear_test_log(self):
+        self.test_log_display.clear()
+
+    def start_auto_configuration(self):
+        if self.auto_config_in_progress:
+            self.auto_config_stop = True
+            self.not_work_btn.setText("Настроить (VPN) Vless")
+            self.auto_config_in_progress = False
+            self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
+            self.add_test_log("Авто-подбор остановлен")
+            
+            if self.test_worker:
+                self.test_worker.stop()
+            return
+            
+        if not self.panel_info:
+            self.add_test_log("Ошибка: нет данных панели. Вернитесь на предыдущие шаги.")
+            return
+            
+        self.auto_config_in_progress = True
+        self.auto_config_stop = False
+        self.not_work_btn.setText("Остановить авто-подбор")
+        self.update_auto_test_status("testing", "#ffc107")  # Желтый - подбор
+        self.clear_test_log()
+        self.add_test_log("Запуск автоматического подбора SNI...")
+        self.add_test_log("Ищем рабочий SNI")
+        
+        threading.Thread(target=self._run_auto_configuration, daemon=True).start()
+
+    def _run_auto_configuration(self):
+        test_count = 0
+        
+        while not self.auto_config_stop and self.auto_config_in_progress:
+            test_count += 1
+            self._emit_test_log(f"Попытка #{test_count}")
+            
+            sni = self.get_next_sni()
+            if not sni:
+                self._emit_test_log("Нет доступных SNI для тестирования")
+                break
+                
+            self._emit_test_log(f"Тестируем SNI: {sni}")
+            
+            config_updated = self._update_configuration_with_sni(sni)
+            if not config_updated:
+                self._emit_test_log(f"Ошибка обновления конфигурации для SNI: {sni}")
+                continue
+                
+            time.sleep(3)
+            
+            if self.auto_config_stop:
+                break
+                
+            speed_ok = self._test_configuration_speed()
+            
+            if speed_ok:
+                download_speed = self.current_stats.get('download', 0)
+                upload_speed = self.current_stats.get('upload', 0)
+                self._emit_test_log(f"Найден рабочий SNI: {sni}")
+                self._emit_test_log(f"Скорость: {download_speed:.2f}/{upload_speed:.2f} МБ/с - ПОДХОДИТ!")
+                
+                self._emit_auto_config_success(sni)
+                break
+            else:
+                download_speed = self.current_stats.get('download', 0)
+                upload_speed = self.current_stats.get('upload', 0)
+                if download_speed > 0 or upload_speed > 0:
+                    self._emit_test_log(f"Скорость {download_speed:.2f}/{upload_speed:.2f} МБ/с - недостаточно")
+                else:
+                    self._emit_test_log("Подключение не работает")
+        
+        self._emit_auto_config_finished()
+
+    def _emit_test_log(self, message):
+        self.test_log_signal.emit(message)
+
+    def _emit_auto_config_success(self, sni):
+        QMetaObject.invokeMethod(self, "_on_auto_config_success", 
+                               Qt.QueuedConnection,
+                               Q_ARG(str, sni))
+
+    def _emit_auto_config_finished(self):
+        QMetaObject.invokeMethod(self, "_on_auto_config_finished", 
+                               Qt.QueuedConnection)
+
+    @Slot(str)
+    def _on_auto_config_success(self, sni):
+        download_speed = self.current_stats.get('download', 0)
+        upload_speed = self.current_stats.get('upload', 0)
+        self.status_label.setText(f"Найден рабочий SNI: {sni} ({download_speed:.1f}/{upload_speed:.1f} МБ/с)")
+        self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
+        self.auto_config_in_progress = False
+        self.not_work_btn.setText("Настроить (VPN) Vless")
+        self.add_test_log("Авто-подбор успешно завершен!")
+
+    @Slot()
+    def _on_auto_config_finished(self):
+        self.auto_config_in_progress = False
+        self.not_work_btn.setText("Настроить (VPN) Vless")
+        self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
+        self.status_label.setText("Авто-подбор завершен")
+        self.add_test_log("Авто-подбор завершен. Подходящий SNI не найден.")
+
+    def _update_configuration_with_sni(self, sni):
+        try:
+            priv_key, pub_key = self._get_keys()
+            if not priv_key or not pub_key:
+                self._emit_test_log("Не удалось получить ключи")
+                return False
+            
+            if self.current_inbound_id:
+                success = self._update_inbound_with_keys(priv_key, pub_key, sni)
+            else:
+                success = self._create_inbound_with_keys(priv_key, pub_key, sni)
+            
+            if success:
+                for i in range(10):
+                    if self.generated_config and self.current_sni == sni:
+                        return True
+                    time.sleep(1)
+                    if self.auto_config_stop:
+                        return False
+            
+            return False
+            
+        except Exception as e:
+            self._emit_test_log(f"Ошибка обновления конфигурации: {e}")
+            return False
+
+    def _get_keys(self):
+        try:
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
+            
+            cmd_get_keys = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
+            
+            self._emit_test_log("Получаем ключи...")
+            
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd_get_keys)
+            
+            if exit_code != 0:
+                raise Exception(f"Ошибка curl: {err}")
+            
+            cleaned_out = self.clean_json_response(out)
+            keys_data = json.loads(cleaned_out)
+                
+            if not keys_data.get('success'):
+                raise Exception(f"API ошибка: {keys_data.get('msg', 'Unknown error')}")
+                
+            priv_key = keys_data['obj']['privateKey']
+            pub_key = keys_data['obj']['publicKey']
+            self._emit_test_log("Ключи получены успешно")
+            return priv_key, pub_key
+            
+        except Exception as e:
+            self._emit_test_log(f"Ошибка получения ключей: {e}")
+            return None, None
+
+    def _create_inbound_with_keys(self, priv_key, pub_key, sni):
+        try:
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
+            
+            short_id = secrets.token_hex(8)
+            client_id = str(uuid.uuid4())
+            
+            settings = {
+                "clients": [
+                    {
+                        "id": client_id,
+                        "flow": "xtls-rprx-vision",
+                        "email": f"client-{secrets.token_hex(4)}",
+                        "limitIp": 0,
+                        "totalGB": 0,
+                        "expiryTime": 0,
+                        "enable": True,
+                        "tgId": "",
+                        "subId": secrets.token_hex(16),
+                        "comment": "",
+                        "reset": 0
+                    }
+                ],
+                "decryption": "none",
+                "fallbacks": []
+            }
+            
+            stream_settings = {
+                "network": "tcp",
+                "security": "reality",
+                "externalProxy": [],
+                "realitySettings": {
+                    "show": False,
+                    "xver": 0,
+                    "dest": f"{sni}:443",
+                    "serverNames": [sni],
+                    "privateKey": priv_key,
+                    "minClientVer": "",
+                    "maxClientVer": "",
+                    "maxTimediff": 0,
+                    "shortIds": [short_id],
+                    "mldsa65Seed": "",
+                    "settings": {
+                        "publicKey": pub_key,
+                        "fingerprint": "chrome",
+                        "serverName": "",
+                        "spiderX": "/",
+                        "mldsa65Verify": ""
+                    }
+                },
+                "tcpSettings": {
+                    "acceptProxyProtocol": False,
+                    "header": {"type": "none"}
+                }
+            }
+            
+            sniffing = {
+                "enabled": True,
+                "destOverride": ["http", "tls"],
+                "metadataOnly": False,
+                "routeOnly": False
+            }
+            
+            from urllib.parse import quote_plus
+            settings_enc = quote_plus(json.dumps(settings, indent=2))
+            stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
+            sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
+            
+            cmd_add = (
+                f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
+                f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
+                f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
+            )
+            
+            self._emit_test_log(f"Создаем inbound с SNI: {sni}")
+            
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd_add)
+            
+            cleaned_out = self.clean_json_response(out)
+            result = json.loads(cleaned_out)
+            
+            if result.get('success'):
+                self._emit_test_log("Inbound создан успешно")
+                self.current_inbound_id = result.get('obj', {}).get('id')
+                self._generate_and_show_vless(client_id, sni, pub_key, short_id)
+                return True
+            else:
+                raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
+                
+        except Exception as e:
+            self._emit_test_log(f"Ошибка создания инбаунда: {e}")
+            return False
+
+    def _update_inbound_with_keys(self, priv_key, pub_key, sni):
+        try:
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
+            
+            short_id = secrets.token_hex(8)
+            
+            if self.existing_clients:
+                settings = {
+                    "clients": self.existing_clients,
+                    "decryption": "none", 
+                    "fallbacks": []
+                }
+                client_id = self.existing_clients[0].get('id', str(uuid.uuid4()))
+            else:
+                client_id = str(uuid.uuid4())
+                settings = {
+                    "clients": [
+                        {
+                            "id": client_id,
+                            "flow": "xtls-rprx-vision",
+                            "email": f"client-{secrets.token_hex(4)}",
+                            "limitIp": 0,
+                            "totalGB": 0,
+                            "expiryTime": 0,
+                            "enable": True,
+                            "tgId": "",
+                            "subId": secrets.token_hex(16),
+                            "comment": "",
+                            "reset": 0
+                        }
+                    ],
+                    "decryption": "none",
+                    "fallbacks": []
+                }
+            
+            stream_settings = {
+                "network": "tcp",
+                "security": "reality",
+                "externalProxy": [],
+                "realitySettings": {
+                    "show": False,
+                    "xver": 0,
+                    "dest": f"{sni}:443",
+                    "serverNames": [sni],
+                    "privateKey": priv_key,
+                    "minClientVer": "",
+                    "maxClientVer": "",
+                    "maxTimediff": 0,
+                    "shortIds": [short_id],
+                    "mldsa65Seed": "",
+                    "settings": {
+                        "publicKey": pub_key,
+                        "fingerprint": "chrome",
+                        "serverName": "",
+                        "spiderX": "/",
+                        "mldsa65Verify": ""
+                    }
+                },
+                "tcpSettings": {
+                    "acceptProxyProtocol": False,
+                    "header": {"type": "none"}
+                }
+            }
+            
+            sniffing = {
+                "enabled": True,
+                "destOverride": ["http", "tls"],
+                "metadataOnly": False,
+                "routeOnly": False
+            }
+            
+            from urllib.parse import quote_plus
+            settings_enc = quote_plus(json.dumps(settings, indent=2))
+            stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
+            sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
+            
+            cmd_update = (
+                f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
+                f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
+                f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
+            )
+            
+            self._emit_test_log(f"Обновляем inbound с SNI: {sni}")
+            
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd_update)
+            
+            cleaned_out = self.clean_json_response(out)
+            result = json.loads(cleaned_out)
+            
+            if result.get('success'):
+                self._emit_test_log("Inbound обновлен успешно")
+                self._generate_and_show_vless(client_id, sni, pub_key, short_id)
+                return True
+            else:
+                raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
+                
+        except Exception as e:
+            self._emit_test_log(f"Ошибка обновления инбаунда: {e}")
+            return False
+
+    def _generate_and_show_vless(self, client_id, sni, public_key, short_id):
+        if not self.server_host:
+            self.server_host = "127.0.0.1"
+            
+        vless_config = f"vless://{client_id}@{self.server_host}:443?type=tcp&security=reality&sni={sni}&fp=chrome&pbk={public_key}&sid={short_id}&flow=xtls-rprx-vision#reality-443"
+        
+        QMetaObject.invokeMethod(self, "_update_vless_display", 
+                               Qt.QueuedConnection,
+                               Q_ARG(str, vless_config),
+                               Q_ARG(str, sni))
+        
+        self.generated_config = vless_config
+        self.current_sni = sni
+
+    @Slot(str, str)
+    def _update_vless_display(self, vless_config, sni):
+        self.vless_display.setPlainText(vless_config)
+        self.status_label.setText(f"Конфигурация создана с SNI: {sni}")
+
+    def _test_configuration_speed(self):
+        if not self.generated_config:
+            return False
+            
+        loop = QEventLoop()
+        test_success = [False]
+        
+        def on_test_completed(stats):
+            test_success[0] = stats.get('speed_ok', False) and stats.get('success', False)
+            loop.quit()
+        
+        self.test_completed_signal.connect(on_test_completed, Qt.QueuedConnection)
+        
+        QTimer.singleShot(0, lambda: self._safe_start_test_thread("speed"))
+        
+        QTimer.singleShot(60000, loop.quit)
+        loop.exec()
+        
+        try:
+            self.test_completed_signal.disconnect(on_test_completed)
+        except:
+            pass
+        
+        return test_success[0]
+
+    def _safe_start_test_thread(self, test_type):
+        if self.testing_in_progress or self.auto_config_stop:
+            return
+            
+        self.start_test_thread(test_type)
+
+    def start_test_thread(self, test_type):
+        if self.testing_in_progress:
+            return
+            
+        self.testing_in_progress = True
+        self.test_btn.setEnabled(False)
+        
+        self.test_thread = QThread()
+        self.test_worker = TestWorker(self.generated_config, test_type)
+        self.test_worker.moveToThread(self.test_thread)
+        
+        self.test_thread.started.connect(self.test_worker.run_test)
+        self.test_worker.finished.connect(self.test_thread.quit)
+        self.test_worker.finished.connect(self.test_worker.deleteLater)
+        self.test_thread.finished.connect(self._on_test_thread_finished)
+        self.test_worker.log_message.connect(self.test_log_signal.emit)
+        self.test_worker.test_completed.connect(self.test_completed_signal.emit)
+        self.test_worker.xray_log.connect(self.xray_log_signal.emit)
+        self.test_worker.curl_log.connect(self.curl_log_signal.emit)
+        self.test_worker.speedtest_log.connect(self.speedtest_log_window.append_log)
+        
+        self.test_thread.start()
+
+    def _on_test_thread_finished(self):
+        self.test_thread.deleteLater()
+        self.testing_in_progress = False
+        self.test_btn.setEnabled(True)
+
+    @Slot(dict)
+    def on_test_completed(self, stats):
+        self.current_stats.update(stats)
 
     def initializePage(self):
         self.update_sni_info()
         self.panel_info = self.page_auth.get_panel_info()
         self.cookie_jar = self.panel_info.get('cookie_jar', '')
+        
+        self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
         
         if self.ssh_mgr.client:
             transport = self.ssh_mgr.client.get_transport()
@@ -1818,37 +2471,7 @@ class PageInbound(BaseWizardPage):
                 self.server_host = transport.getpeername()[0]
                 self.log_message(f"IP сервера: {self.server_host}")
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_L and event.modifiers() == Qt.ControlModifier:
-            self.show_hidden_logs()
-        else:
-            super().keyPressEvent(event)
-
-    def show_hidden_logs(self):
-        if not self.hidden_log_window:
-            self.hidden_log_window = QDialog(self)
-            self.hidden_log_window.setWindowTitle("Логи тестирования")
-            self.hidden_log_window.setMinimumSize(600, 400)
-            layout = QVBoxLayout()
-            
-            log_display = QPlainTextEdit()
-            log_display.setReadOnly(True)
-            log_display.setPlainText("\n".join(self.hidden_logs))
-            
-            layout.addWidget(QLabel("Логи тестирования:"))
-            layout.addWidget(log_display)
-            
-            close_btn = QPushButton("Закрыть")
-            close_btn.clicked.connect(self.hidden_log_window.close)
-            layout.addWidget(close_btn)
-            
-            self.hidden_log_window.setLayout(layout)
-        
-        self.hidden_log_window.show()
-        self.hidden_log_window.raise_()
-
-    def add_hidden_log(self, message):
-        self.hidden_logs.append(f"{datetime.now().strftime('%H:%M:%S')} - {message}")
+        self.start_configuration()
 
     def update_sni_info(self):
         used_count = self.sni_manager.get_used_count()
@@ -1861,31 +2484,14 @@ class PageInbound(BaseWizardPage):
             self.current_sni = sni
             self.sni_manager.mark_sni_used(sni)
             self.update_sni_info()
-            self.log_message(f"[sni] Используем SNI: {sni}")
+            self.log_message(f"Используем SNI: {sni}")
         return sni
 
     def start_configuration(self):
-        self.status_label.setText("Начинаем настройку подколючения...")
+        self.status_label.setText("Начинаем настройку подключения...")
         self.clear_test_log()
         self.current_stats = {'ping': 0, 'download': 0, 'upload': 0, 'success': False, 'speed_ok': False}
         self.check_existing_inbound()
-
-    def clear_test_log(self):
-        self.test_log_display.clear()
-
-    @Slot(str)
-    def add_test_log(self, message):
-        current_text = self.test_log_display.toPlainText()
-        new_text = current_text + f"{datetime.now().strftime('%H:%M:%S')} - {message}\n"
-        self.test_log_display.setPlainText(new_text)
-        cursor = self.test_log_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.test_log_display.setTextCursor(cursor)
-
-    @Slot(str)
-    def add_auto_test_log(self, message):
-        if hasattr(self, 'auto_test_window') and self.auto_test_window:
-            self.auto_test_window.add_log(message)
 
     def check_existing_inbound(self):
         self.log_message("Проверяем существующие inbound...")
@@ -1923,11 +2529,9 @@ class PageInbound(BaseWizardPage):
                         break
                 
                 if inbound_found:
-                    self.log_message(f"DEBUG: current_inbound_id = {self.current_inbound_id}, обновляем существующий inbound")
-                    self.update_inbound_sni()
+                    self.status_label.setText("Найден существующий инбаунд. Нажмите 'Настроить (VPN) Vless' для подбора SNI")
                 else:
-                    self.log_message("DEBUG: inbound не найден, создаем новый")
-                    self.create_new_inbound()
+                    self.status_label.setText("Инбаунд не найден. Нажмите 'Настроить (VPN) Vless' для создания")
             else:
                 raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
                 
@@ -1971,275 +2575,6 @@ class PageInbound(BaseWizardPage):
         else:
             self.status_label.setText(f"Ошибка: {error_message}")
 
-    def create_new_inbound(self):
-        self.log_message("Создаем новый inbound на порту 443...")
-        priv_key, pub_key = self.get_keys()
-        if not priv_key or not pub_key:
-            return
-        sni = self.get_next_sni()
-        if not sni:
-            self.status_label.setText("Ошибка: нет доступных SNI")
-            return
-        self.create_inbound_with_keys(priv_key, pub_key, sni)
-
-    def create_new_inbound(self):
-        self.log_message("Создаем новый inbound на порту 443...")
-        priv_key, pub_key = self.get_keys()
-        if not priv_key or not pub_key:
-            return False
-        sni = self.get_next_sni()
-        if not sni:
-            self.status_label.setText("Ошибка: нет доступных SNI")
-            return False
-        
-        target_sni = sni
-        self.create_inbound_with_keys(priv_key, pub_key, sni)
-        
-        if self.generated_config and self.current_sni == target_sni:
-            return True
-        return False
-
-    def get_keys(self):
-        base_url = self.panel_info['base_url']
-        use_https = self.panel_info.get('use_https', False)
-        ssl_options = "-k" if use_https else ""
-        
-        cmd_get_keys = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
-        
-        self.log_message("Получаем ключи...")
-        
-        try:
-            exit_code, out, err = self.ssh_mgr.exec_command(cmd_get_keys)
-            
-            if exit_code != 0:
-                raise Exception(f"Ошибка curl: {err}")
-            
-            cleaned_out = self.clean_json_response(out)
-            keys_data = json.loads(cleaned_out)
-                
-            if not keys_data.get('success'):
-                raise Exception(f"API ошибка: {keys_data.get('msg', 'Unknown error')}")
-                
-            priv_key = keys_data['obj']['privateKey']
-            pub_key = keys_data['obj']['publicKey']
-            self.log_message("Ключи получены успешно")
-            return priv_key, pub_key
-            
-        except Exception as e:
-            self.log_message(f"Ошибка получения ключей: {e}")
-            if "10054" in str(e):
-                self.log_message("Повторяем запрос...")
-                time.sleep(2)
-                return self.get_keys()
-            else:
-                self.handle_api_error(f"Ошибка получения ключей: {e}")
-                return None, None
-
-    def create_inbound_with_keys(self, priv_key, pub_key, sni):
-        base_url = self.panel_info['base_url']
-        use_https = self.panel_info.get('use_https', False)
-        ssl_options = "-k" if use_https else ""
-        
-        short_id = secrets.token_hex(8)
-        client_id = str(uuid.uuid4())
-        
-        settings = {
-            "clients": [
-                {
-                    "id": client_id,
-                    "flow": "xtls-rprx-vision",
-                    "email": f"client-{secrets.token_hex(4)}",
-                    "limitIp": 0,
-                    "totalGB": 0,
-                    "expiryTime": 0,
-                    "enable": True,
-                    "tgId": "",
-                    "subId": secrets.token_hex(16),
-                    "comment": "",
-                    "reset": 0
-                }
-            ],
-            "decryption": "none",
-            "fallbacks": []
-        }
-        
-        stream_settings = {
-            "network": "tcp",
-            "security": "reality",
-            "externalProxy": [],
-            "realitySettings": {
-                "show": False,
-                "xver": 0,
-                "dest": f"{sni}:443",
-                "serverNames": [sni],
-                "privateKey": priv_key,
-                "minClientVer": "",
-                "maxClientVer": "",
-                "maxTimediff": 0,
-                "shortIds": [short_id],
-                "mldsa65Seed": "",
-                "settings": {
-                    "publicKey": pub_key,
-                    "fingerprint": "chrome",
-                    "serverName": "",
-                    "spiderX": "/",
-                    "mldsa65Verify": ""
-                }
-            },
-            "tcpSettings": {
-                "acceptProxyProtocol": False,
-                "header": {"type": "none"}
-            }
-        }
-        
-        sniffing = {
-            "enabled": True,
-            "destOverride": ["http", "tls"],
-            "metadataOnly": False,
-            "routeOnly": False
-        }
-        
-        from urllib.parse import quote_plus
-        settings_enc = quote_plus(json.dumps(settings, indent=2))
-        stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
-        sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
-        
-        cmd_add = (
-            f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
-            f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
-            f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
-        )
-        
-        self.log_message(f"Создаем inbound с SNI: {sni}")
-        
-        try:
-            exit_code, out, err = self.ssh_mgr.exec_command(cmd_add)
-            
-            cleaned_out = self.clean_json_response(out)
-            result = json.loads(cleaned_out)
-            
-            if result.get('success'):
-                self.log_message("Inbound создан успешно")
-                self.current_inbound_id = result.get('obj', {}).get('id')
-                self.generate_and_show_vless(client_id, sni, pub_key, short_id)
-            else:
-                raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
-                
-        except Exception as e:
-            self.log_message(f"Ошибка создания инбаунда: {e}")
-            if "10054" in str(e):
-                self.log_message("Повторяем запрос...")
-                time.sleep(2)
-                self.create_inbound_with_keys(priv_key, pub_key, sni)
-            else:
-                self.handle_api_error(f"Ошибка создания инбаунда: {e}")
-
-    def update_inbound_with_keys(self, priv_key, pub_key, sni):
-        base_url = self.panel_info['base_url']
-        use_https = self.panel_info.get('use_https', False)
-        ssl_options = "-k" if use_https else ""
-        
-        short_id = secrets.token_hex(8)
-        
-        if self.existing_clients:
-            settings = {
-                "clients": self.existing_clients,
-                "decryption": "none", 
-                "fallbacks": []
-            }
-            client_id = self.existing_clients[0].get('id', str(uuid.uuid4()))
-        else:
-            client_id = str(uuid.uuid4())
-            settings = {
-                "clients": [
-                    {
-                        "id": client_id,
-                        "flow": "xtls-rprx-vision",
-                        "email": f"client-{secrets.token_hex(4)}",
-                        "limitIp": 0,
-                        "totalGB": 0,
-                        "expiryTime": 0,
-                        "enable": True,
-                        "tgId": "",
-                        "subId": secrets.token_hex(16),
-                        "comment": "",
-                        "reset": 0
-                    }
-                ],
-                "decryption": "none",
-                "fallbacks": []
-            }
-        
-        stream_settings = {
-            "network": "tcp",
-            "security": "reality",
-            "externalProxy": [],
-            "realitySettings": {
-                "show": False,
-                "xver": 0,
-                "dest": f"{sni}:443",
-                "serverNames": [sni],
-                "privateKey": priv_key,
-                "minClientVer": "",
-                "maxClientVer": "",
-                "maxTimediff": 0,
-                "shortIds": [short_id],
-                "mldsa65Seed": "",
-                "settings": {
-                    "publicKey": pub_key,
-                    "fingerprint": "chrome",
-                    "serverName": "",
-                    "spiderX": "/",
-                    "mldsa65Verify": ""
-                }
-            },
-            "tcpSettings": {
-                "acceptProxyProtocol": False,
-                "header": {"type": "none"}
-            }
-        }
-        
-        sniffing = {
-            "enabled": True,
-            "destOverride": ["http", "tls"],
-            "metadataOnly": False,
-            "routeOnly": False
-        }
-        
-        from urllib.parse import quote_plus
-        settings_enc = quote_plus(json.dumps(settings, indent=2))
-        stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
-        sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
-        
-        cmd_update = (
-            f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
-            f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
-            f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
-        )
-        
-        self.log_message(f"Обновляем inbound с SNI: {sni}")
-        
-        try:
-            exit_code, out, err = self.ssh_mgr.exec_command(cmd_update)
-            
-            cleaned_out = self.clean_json_response(out)
-            result = json.loads(cleaned_out)
-            
-            if result.get('success'):
-                self.log_message("Inbound обновлен успешно")
-                self.generate_and_show_vless(client_id, sni, pub_key, short_id)
-            else:
-                raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
-                
-        except Exception as e:
-            self.log_message(f"Ошибка обновления инбаунда: {e}")
-            if "10054" in str(e):
-                self.log_message("Повторяем запрос...")
-                time.sleep(2)
-                self.update_inbound_with_keys(priv_key, pub_key, sni)
-            else:
-                self.handle_api_error(f"Ошибка обновления инбаунда: {e}")
-
     def test_vless_config(self):
         if not self.generated_config:
             self.add_test_log("Ошибка: нет конфигурации для тестирования")
@@ -2249,308 +2584,21 @@ class PageInbound(BaseWizardPage):
             self.add_test_log("Тестирование уже выполняется...")
             return
     
-        test_type = "url"
+        test_type = "speed" if self.speed_test_radio.isChecked() else "url"
         self.start_test_thread(test_type)
-        #test_type = "speed" if self.speed_test_radio.isChecked() else "url"
-        #self.start_test_thread(test_type)
-
-    def start_test_thread(self, test_type):
-        self.testing_in_progress = True
-        self.test_btn.setEnabled(False)
-        self.clear_test_log()
-        self.add_test_log(f"Начинаем тестирование конфигурации ({'URL + скорость' if test_type == 'speed' else 'URL тест'})...")
-        
-        self.test_thread = QThread()
-        self.test_worker = TestWorker(self.generated_config, test_type)
-        self.test_worker.moveToThread(self.test_thread)
-        
-        self.test_thread.started.connect(self.test_worker.run_test)
-        self.test_worker.finished.connect(self.test_thread.quit)
-        self.test_worker.finished.connect(self.test_worker.deleteLater)
-        self.test_thread.finished.connect(self.test_thread.deleteLater)
-        self.test_worker.log_message.connect(self.test_log_signal.emit)
-        self.test_worker.test_completed.connect(self.test_completed_signal.emit)
-        
-        self.test_thread.start()
-
-    @Slot(dict)
-    def on_test_completed(self, stats):
-        self.current_stats.update(stats)
-        self.testing_in_progress = False
-        self.test_btn.setEnabled(True)
-
-    def show_auto_test_window(self):
-        self.auto_test_window = AutoTestWindow(self.sni_manager, self)
-        self.auto_test_window.show()
-
-    def start_auto_test_from_window(self, test_type, stop_on_first):
-        if self.auto_testing:
-            self.auto_test_stop = True
-            return
-            
-        self.auto_testing = True
-        self.auto_test_stop = False
-        
-        self.auto_test_log_signal.emit(f"Запуск автотестирования SNI ({'URL + скорость' if test_type == 'speed' else 'URL тест'})...")
-        
-        threading.Thread(target=self._run_auto_test, args=(test_type, stop_on_first), daemon=True).start()
-
-    def _run_auto_test(self, test_type, stop_on_first):
-        test_count = 0
-        working_snis = []
-        
-        while not self.auto_test_stop:
-            test_count += 1
-            
-            sni = self.get_next_sni()
-            if not sni:
-                self.auto_test_log_signal.emit("Нет доступных SNI для тестирования")
-                break
-                
-            self.auto_test_log_signal.emit(f"Тест #{test_count} - SNI: {sni}")
-            
-            # Ждем завершения операции с инбаундом
-            inbound_updated = self._wait_for_inbound_update(sni)
-            if not inbound_updated:
-                self.auto_test_log_signal.emit(f"Ошибка обновления инбаунда для SNI: {sni}")
-                continue
-                
-            # Даем время для применения изменений
-            time.sleep(3)
-            
-            success = self._test_current_config(test_type)
-            
-            if success:
-                working_snis.append({
-                    'sni': self.current_sni,
-                    'config': self.generated_config,
-                    'test_type': test_type
-                })
-                
-                if hasattr(self, 'auto_test_window'):
-                    self.auto_test_window.add_working_sni(self.current_sni, test_type)
-                
-                self.auto_test_log_signal.emit(f"SNI {self.current_sni} - РАБОТАЕТ")
-                
-                if stop_on_first:
-                    self.auto_test_log_signal.emit("Найден подходящий SNI! Автотестирование завершено.")
-                    break
-            else:
-                self.auto_test_log_signal.emit(f"SNI {self.current_sni} - не подходит")
-                
-        self.auto_testing = False
-        
-        if hasattr(self, 'auto_test_window'):
-            self.auto_test_window.testing_finished()
-        
-        self.auto_test_log_signal.emit("Автотестирование завершено")
-        self.auto_test_log_signal.emit(f"Найдено рабочих SNI: {len(working_snis)}")
-    
-    def _wait_for_inbound_update(self, sni):
-        max_attempts = 5
-        for attempt in range(max_attempts):
-            if self.auto_test_stop:
-                return False
-            
-            if self.current_inbound_id:
-                success = self.update_inbound_sni()
-            else:
-                success = self.create_new_inbound()
-            
-            if success:
-                return True
-            
-            self.auto_test_log_signal.emit(f"Ожидание конфигурации... попытка {attempt + 1}")
-            time.sleep(3)
-        
-        return False
-
-    def _test_current_config(self, test_type):
-        try:
-            vless_url = self.generated_config
-            parsed = urlparse(vless_url)
-            server_address = parsed.hostname
-            server_port = parsed.port or 443
-            user_id = parsed.username
-            query_params = parse_qs(parsed.query)
-            sni = query_params.get('sni', [''])[0]
-            public_key = query_params.get('pbk', [''])[0]
-            short_id = query_params.get('sid', [''])[0]
-            flow = query_params.get('flow', [''])[0]
-
-            config = {
-                "log": {
-                    "loglevel": "warning"
-                },
-                "inbounds": [
-                    {
-                        "port": 3080,
-                        "listen": "127.0.0.1",
-                        "protocol": "socks",
-                        "settings": {
-                            "udp": True,
-                            "auth": "noauth"
-                        }
-                    }
-                ],
-                "outbounds": [
-                    {
-                        "tag": "vless-reality",
-                        "protocol": "vless",
-                        "settings": {
-                            "vnext": [
-                                {
-                                    "address": server_address,
-                                    "port": server_port,
-                                    "users": [
-                                        {
-                                            "id": user_id,
-                                            "flow": flow,
-                                            "encryption": "none",
-                                            "level": 0
-                                        }
-                                    ]
-                                }
-                            ]
-                        },
-                        "streamSettings": {
-                            "network": "tcp",
-                            "security": "reality",
-                            "realitySettings": {
-                                "publicKey": public_key,
-                                "fingerprint": "chrome",
-                                "serverName": sni,
-                                "shortId": short_id,
-                                "spiderX": "/"
-                            }
-                        }
-                    }
-                ]
-            }
-
-            temp_config = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8')
-            json.dump(config, temp_config, indent=2)
-            temp_config.flush()
-            temp_config.close()
-
-            xray_path = self.find_xray()
-            if not xray_path:
-                return False
-
-            xray_process = subprocess.Popen(
-                [xray_path, "run", "-config", temp_config.name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',
-                errors='ignore'
-            )
-
-            time.sleep(5)
-
-            test_cmd = [
-                "curl", 
-                "--socks5", "127.0.0.1:3080",
-                "--connect-timeout", "10",
-                "--max-time", "15",
-                "http://cp.cloudflare.com/"
-            ]
-
-            try:
-                result = subprocess.run(test_cmd, timeout=20, capture_output=True, text=True)
-                
-                url_works = result.returncode == 0
-                
-                if url_works and test_type == "speed":
-                    speed_result = self.run_speedtest_auto()
-                    if speed_result:
-                        download_speed = speed_result.get('download', 0)
-                        upload_speed = speed_result.get('upload', 0)
-                        speed_works = download_speed > 10 and upload_speed > 10
-                    else:
-                        speed_works = False
-                else:
-                    speed_works = url_works
-
-            except Exception:
-                url_works = False
-                speed_works = False
-
-            try:
-                xray_process.terminate()
-                xray_process.wait(timeout=3)
-            except:
-                xray_process.kill()
-
-            try:
-                os.unlink(temp_config.name)
-            except:
-                pass
-
-            return url_works and (test_type == "url" or speed_works)
-
-        except Exception:
-            return False
-
-    def run_speedtest_auto(self):
-        try:
-            socks.set_default_proxy(socks.SOCKS5, "127.0.0.1", 3080)
-            socket.socket = socks.socksocket
-            
-            # Быстрый тест только скачивания для автотеста
-            download_url = "https://cloudflare.com/cdn-cgi/trace"
-            start_time = time.time()
-            
-            response = requests.get(download_url, timeout=15)
-            download_time = time.time() - start_time
-            
-            # Оцениваем скорость на основе времени загрузки небольшого файла
-            file_size = len(response.content)  # Размер ответа в байтах
-            download_speed = (file_size * 8) / (download_time * 1_000_000) if download_time > 0 else 0
-            
-            return {
-                "download": download_speed,
-                "upload": download_speed * 0.8  # Предполагаемая скорость отдачи
-            }
-            
-        except Exception as e:
-            return None
-
-    def generate_and_show_vless(self, client_id, sni, public_key, short_id):
-        if not self.server_host:
-            self.server_host = "127.0.0.1"
-            
-        vless_config = f"vless://{client_id}@{self.server_host}:443?type=tcp&security=reality&sni={sni}&fp=chrome&pbk={public_key}&sid={short_id}&flow=xtls-rprx-vision#reality-443"
-        
-        self.vless_display.setPlainText(vless_config)
-        self.generated_config = vless_config
-        
-        self.status_label.setText(f"Конфигурация создана с SNI: {sni}")
-        
-        self.log_message(f"VLESS конфигурация создана с SNI: {sni}")
 
     def config_works(self):
+        self.auto_config_stop = True
+        self.auto_config_in_progress = False
+        
         if self.test_worker:
             self.test_worker.stop()
+            
+        self.not_work_btn.setText("Настроить (VPN) Vless")
+        self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
         self.status_label.setText("Конфигурация работает! Настройка завершена.")
-        
         self.add_test_log("Конфигурация подтверждена - работает корректно")
         self.log_message("Настройка завершена успешно!")
-
-    def config_not_works(self):
-        if self.test_worker:
-            self.test_worker.stop()
-        self.status_label.setText("Пробуем другой SNI...")
-        self.clear_test_log()
-        
-        if self.is_first_configuration:
-            self.not_work_btn.setText("Перенастроить (VPN) Vless")
-            self.is_first_configuration = False
-        
-        if self.current_inbound_id:
-            self.update_inbound_sni()
-        else:
-            self.check_existing_inbound()
 
     def clean_json_response(self, response):
         cleaned = response.strip()
@@ -2573,146 +2621,7 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-
-class AutoTestWindow(QDialog):
-    def __init__(self, sni_manager, parent_page):
-        super().__init__()
-        self.sni_manager = sni_manager
-        self.parent_page = parent_page
-        self.working_snis = []
-        
-        self.setWindowTitle("Автотестирование SNI")
-        self.setMinimumSize(700, 500)
-        
-        layout = QVBoxLayout()
-        
-        tab_widget = QTabWidget()
-        
-        settings_tab = QWidget()
-        settings_layout = QVBoxLayout(settings_tab)
-        
-        test_group = QGroupBox("Настройки тестирования")
-        test_layout = QVBoxLayout(test_group)
-        
-        self.test_url_only = QRadioButton("Только URL тест (быстро)")
-        self.test_url_only.setChecked(True)
-        self.test_url_speed = QRadioButton("URL тест + скорость (медленно)")
-        
-        test_layout.addWidget(self.test_url_only)
-        test_layout.addWidget(self.test_url_speed)
-        
-        options_group = QGroupBox("Опции")
-        options_layout = QVBoxLayout(options_group)
-        
-        self.stop_on_first = QCheckBox("Остановить при первом рабочем SNI")
-        self.stop_on_first.setChecked(True)
-        
-        options_layout.addWidget(self.stop_on_first)
-        
-        self.start_btn = QPushButton("Начать автотестирование")
-        self.start_btn.clicked.connect(self.start_auto_test)
-        self.stop_btn = QPushButton("Остановить")
-        self.stop_btn.clicked.connect(self.stop_auto_test)
-        self.stop_btn.setEnabled(False)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.addWidget(self.start_btn)
-        btn_layout.addWidget(self.stop_btn)
-        
-        settings_layout.addWidget(test_group)
-        settings_layout.addWidget(options_group)
-        settings_layout.addLayout(btn_layout)
-        settings_layout.addStretch()
-        
-        logs_tab = QWidget()
-        logs_layout = QVBoxLayout(logs_tab)
-        
-        self.log_display = QPlainTextEdit()
-        self.log_display.setReadOnly(True)
-        logs_layout.addWidget(QLabel("Логи автотестирования:"))
-        logs_layout.addWidget(self.log_display)
-        
-        results_tab = QWidget()
-        results_layout = QVBoxLayout(results_tab)
-        
-        self.results_list = QListWidget()
-        self.export_btn = QPushButton("Экспортировать список SNI")
-        self.export_btn.clicked.connect(self.export_snis)
-        self.export_btn.setEnabled(False)
-        
-        results_layout.addWidget(QLabel("Рабочие SNI:"))
-        results_layout.addWidget(self.results_list)
-        results_layout.addWidget(self.export_btn)
-        
-        tab_widget.addTab(settings_tab, "Настройки")
-        tab_widget.addTab(logs_tab, "Логи тестирования")
-        tab_widget.addTab(results_tab, "Результаты")
-        
-        layout.addWidget(tab_widget)
-        self.setLayout(layout)
-        
-    def start_auto_test(self):
-        test_type = "speed" if self.test_url_speed.isChecked() else "url"
-        stop_on_first = self.stop_on_first.isChecked()
-        
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.working_snis = []
-        self.results_list.clear()
-        self.log_display.clear()
-        self.export_btn.setEnabled(False)
-        
-        self.add_log("Начинаем автотестирование SNI...")
-        self.parent_page.start_auto_test_from_window(test_type, stop_on_first)
-        
-    def stop_auto_test(self):
-        self.parent_page.auto_test_stop = True
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.add_log("Автотестирование остановлено пользователем")
-        
-    def add_working_sni(self, sni, test_type):
-        item_text = sni
-        if test_type == "speed":
-            item_text += " (URL + скорость)"
-        else:
-            item_text += " (URL тест)"
-            
-        self.working_snis.append(sni)
-        self.results_list.addItem(item_text)
-        
-    def testing_finished(self):
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        if self.working_snis:
-            self.export_btn.setEnabled(True)
-            
-    def export_snis(self):
-        if not self.working_snis:
-            return
-            
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "Экспортировать SNI", "working_snis.txt", "Text Files (*.txt)"
-        )
-        
-        if file_path:
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    for sni in self.working_snis:
-                        f.write(sni + '\n')
-                QMessageBox.information(self, "Успех", f"Список SNI экспортирован в {file_path}")
-            except Exception as e:
-                QMessageBox.warning(self, "Ошибка", f"Не удалось экспортировать: {e}")
-                
-    def add_log(self, message):
-        current_text = self.log_display.toPlainText()
-        new_text = current_text + f"{datetime.now().strftime('%H:%M:%S')} - {message}\n"
-        self.log_display.setPlainText(new_text)
-        cursor = self.log_display.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_display.setTextCursor(cursor)
-
-CURRENT_VERSION = "1.0.4"
+CURRENT_VERSION = "1.1.0"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
@@ -2746,7 +2655,7 @@ class XUIWizard(QWizard):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vless Wizard")
-        self.resize(558, 582)
+        self.resize(590, 510)
         
         self.log_window = LogWindow()
         self.ssh_mgr = SSHManager()
@@ -2757,7 +2666,7 @@ class XUIWizard(QWizard):
         self.page_install = PageInstallXUI(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
         self.page_auth = PagePanelAuth(self.ssh_mgr, self.logger_sig, self.page_install, self.log_window, self.sni_manager)
         self.page_backup = PageBackupPanel(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
-        self.page_inbound = PageInbound(self.ssh_mgr, self.logger_sig, self.page_auth, self.log_window, self.sni_manager)
+        self.page_inbound = PageInbound(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager, self.page_auth)
         
         self.addPage(self.page_ssh)
         self.addPage(self.page_install)
@@ -2772,7 +2681,7 @@ class XUIWizard(QWizard):
         self.setButtonText(QWizard.CustomButton1, "Логи")
         self.customButtonClicked.connect(self.toggle_logs)
         
-        self.logger_sig.new_line.connect(self.log_window.append_log)
+        self.logger_sig.new_line.connect(self.log_window.append_main_log)
 
     def toggle_logs(self):
         if self.log_window.isVisible():
