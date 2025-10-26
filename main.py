@@ -1809,7 +1809,8 @@ class PageInbound(BaseWizardPage):
         
         self.info_label = QLabel(
             "Инструкции по настройке и использованию VPN-приложений доступны "
-            "<a href='https://wiki.yukikras.net/ru/nastroikavpn'>здесь</a>."
+            "<a href='https://wiki.yukikras.net/ru/nastroikavpn'>здесь</a>.<br>"
+            "Автоподбор настроек находится в статусе БЕТА, рекомендуется подбирать SNI вручную."
         )
         self.info_label.setOpenExternalLinks(True)
         
@@ -1893,7 +1894,7 @@ class PageInbound(BaseWizardPage):
         self.test_actions_layout = QHBoxLayout()
         #self.work_btn = QPushButton("Работает - завершить работу мастера")
         #self.work_btn.clicked.connect(self.config_works)
-        self.not_work_btn = QPushButton("Настроить (VPN) Vless")
+        self.not_work_btn = QPushButton("Настроить (VPN) Vless автоматически")
         self.not_work_btn.clicked.connect(self.start_auto_configuration)
         
         #self.test_actions_layout.addWidget(self.work_btn)
