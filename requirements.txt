@@ -5,3 +5,4 @@ packaging
 pysocks
 qrcode
 speedtest-cli
+pillow
