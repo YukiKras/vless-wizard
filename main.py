@@ -1627,17 +1627,13 @@ class TestWorker(QObject):
                     stats['speed_ok'] = download_speed > 10 and upload_speed > 10
                     stats['success'] = True
                     
-                    self.log_message.emit(f"Пинг: {ping:.2f} мс")
-                    self.log_message.emit(f"Скорость скачивания: {download_speed:.2f} Мбит/с")
-                    self.log_message.emit(f"Скорость загрузки: {upload_speed:.2f} Мбит/с")
-                    
                     if stats['speed_ok']:
-                        self.log_message.emit("Скорость выше 10 Мбит/с в обе стороны - отлично!")
+                        self.log_message.emit("Скорость в норме.")
                     else:
                         if download_speed <= 10:
-                            self.log_message.emit(f"Скорость скачивания {download_speed:.2f} Мбит/с недостаточна")
+                            self.log_message.emit(f"Скорость скачивания не в норме")
                         if upload_speed <= 10:
-                            self.log_message.emit(f"Скорость загрузки {upload_speed:.2f} Мбит/с недостаточна")
+                            self.log_message.emit(f"Скорость загрузки не в норме")
                 else:
                     self.log_message.emit("Ошибка измерения скорости")
                     stats['success'] = False
@@ -1937,7 +1933,7 @@ class PageInbound(BaseWizardPage):
         """Обновляет статус автотестирования с указанным цветом"""
         status_texts = {
             "waiting": "ОЖИДАНИЕ",
-            "testing": "ПОДБОР SNI",
+            "testing": "Идёт автоматический подбор настроек, пожалуйста ожидайте.",
             "success": "УСПЕХ"
         }
         
@@ -2079,7 +2075,6 @@ class PageInbound(BaseWizardPage):
                 download_speed = self.current_stats.get('download', 0)
                 upload_speed = self.current_stats.get('upload', 0)
                 self._emit_test_log(f"Найден рабочий SNI: {sni}")
-                self._emit_test_log(f"Скорость: {download_speed:.2f}/{upload_speed:.2f} МБ/с - ПОДХОДИТ!")
                 
                 self._emit_auto_config_success(sni)
                 break
@@ -2087,7 +2082,7 @@ class PageInbound(BaseWizardPage):
                 download_speed = self.current_stats.get('download', 0)
                 upload_speed = self.current_stats.get('upload', 0)
                 if download_speed > 0 or upload_speed > 0:
-                    self._emit_test_log(f"Скорость {download_speed:.2f}/{upload_speed:.2f} МБ/с - недостаточно")
+                    self._emit_test_log(f"Скорость ниже средней")
                 else:
                     self._emit_test_log("Подключение не работает")
         
@@ -2109,7 +2104,7 @@ class PageInbound(BaseWizardPage):
     def _on_auto_config_success(self, sni):
         download_speed = self.current_stats.get('download', 0)
         upload_speed = self.current_stats.get('upload', 0)
-        self.status_label.setText(f"Найден рабочий SNI: {sni} ({download_speed:.1f}/{upload_speed:.1f} МБ/с)")
+        self.status_label.setText(f"Авто-подбор успешно завершен, скопируйте Vless ключ")
         self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
         self.auto_config_in_progress = False
         self.not_work_btn.setText("Настроить (VPN) Vless")
@@ -2121,7 +2116,7 @@ class PageInbound(BaseWizardPage):
         self.not_work_btn.setText("Настроить (VPN) Vless")
         self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
         self.status_label.setText("Авто-подбор завершен")
-        self.add_test_log("Авто-подбор завершен. Подходящий SNI не найден.")
+        self.add_test_log("Авто-подбор завершен")
 
     def _update_configuration_with_sni(self, sni):
         try:
@@ -2621,7 +2616,7 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-CURRENT_VERSION = "1.1.0"
+CURRENT_VERSION = "1.1.1"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
