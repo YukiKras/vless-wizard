@@ -1,2 +1,4 @@
 dist/
 venv/
+.venv/
+xui*.db

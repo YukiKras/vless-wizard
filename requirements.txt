@@ -4,3 +4,5 @@ PySide6
 packaging
 cloudflarepycli
 pysocks
+qrcode
+speedtest
