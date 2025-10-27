@@ -14,6 +14,7 @@ import random
 import socket
 import socks
 import qrcode
+from PIL import Image
 import importlib.util
 from datetime import datetime
 from pathlib import Path
@@ -3218,11 +3219,21 @@ class XUIWizard(QWizard):
         self.setOption(QWizard.IndependentPages, False)
         self.setWizardStyle(QWizard.ModernStyle)
         self.setOption(QWizard.NoBackButtonOnStartPage, True)
+        self.setOption(QWizard.NoBackButtonOnLastPage, True)
         self.setOption(QWizard.HaveCustomButton1, True)
         self.setButtonText(QWizard.CustomButton1, "Логи")
         self.customButtonClicked.connect(self.toggle_logs)
         
+        self.currentIdChanged.connect(self.hide_back_button)
+        self.hide_back_button()
+        
         self.logger_sig.new_line.connect(self.log_window.append_main_log)
+
+    def hide_back_button(self):
+        """Скрывает кнопку назад"""
+        back_button = self.button(QWizard.BackButton)
+        if back_button:
+            back_button.hide()
 
     def toggle_logs(self):
         if self.log_window.isVisible():
