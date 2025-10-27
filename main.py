@@ -2919,7 +2919,7 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-CURRENT_VERSION = "1.1.1"
+CURRENT_VERSION = "1.1.2"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
