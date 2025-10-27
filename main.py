@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QApplication, QWizard, QWizardPage, QLabel, QLineEdit, QPushButton, QVBoxLayout,
     QHBoxLayout, QFileDialog, QTextEdit, QMessageBox, QPlainTextEdit, QCheckBox, QComboBox,
     QProgressBar, QDialogButtonBox, QListWidget, QGroupBox, QWidget, QTabWidget, QDialog, QFrame,
-    QRadioButton, QButtonGroup
+    QRadioButton, QButtonGroup, QProgressDialog
 )
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QEvent, Signal, QThread, Slot, QTranslator, QLocale, QLibraryInfo, QMetaObject, Qt, QEventLoop, Q_ARG
 from PySide6.QtGui import QClipboard, QTextCursor, QPixmap, QShortcut, QKeySequence
@@ -316,6 +316,28 @@ class SNIManager:
         available = self.load_available_sni()
         return len(available)
 
+    def get_total_count(self):
+        return len(self.available_sni)
+    
+    def refresh_sni_list(self):
+        try:
+            old_count = len(self.available_sni)
+            
+            self.available_sni = get_sni_whitelist()
+            
+            self.used_sni.clear()
+            self.current_index = 0
+            
+            new_count = len(self.available_sni)
+            
+            #self.log_message(f"[SNIManager] Список SNI обновлен. Было: {old_count}, стало: {new_count}")
+            
+            return True
+            
+        except Exception as e:
+            #self.log_message(f"[SNIManager] Ошибка обновления списка SNI: {e}")
+            return False
+
 class LoggerSignal(QObject):
     new_line = Signal(str)
 
@@ -368,37 +390,123 @@ class LogWindow(QTabWidget):
         self.append_main_log(line)
 
 class SpeedtestLogWindow(QWidget):
-    def __init__(self):
+    log_signal = Signal(str)
+
+    def __init__(self, worker=None):
         super().__init__()
+        self.worker = worker
         self.init_ui()
-        
+        self.log_signal.connect(self.append_log)
+
     def init_ui(self):
         self.setWindowTitle("Логи Speedtest")
-        self.setMinimumSize(600, 400)
-        
+        self.setMinimumSize(600, 500)
+
         layout = QVBoxLayout()
-        
+
         self.log_display = QPlainTextEdit()
         self.log_display.setReadOnly(True)
-        
-        clear_btn = QPushButton("Очистить логи")
-        clear_btn.clicked.connect(self.clear_logs)
-        
         layout.addWidget(QLabel("Логи тестирования скорости:"))
         layout.addWidget(self.log_display)
-        layout.addWidget(clear_btn)
-        
+
+        proxy_layout = QHBoxLayout()
+        proxy_layout.addWidget(QLabel("Прокси хост:"))
+        self.proxy_host_input = QLineEdit("127.0.0.1")
+        proxy_layout.addWidget(self.proxy_host_input)
+
+        proxy_layout.addWidget(QLabel("Прокси порт:"))
+        self.proxy_port_input = QLineEdit("3080")
+        proxy_layout.addWidget(self.proxy_port_input)
+
+        layout.addLayout(proxy_layout)
+
+        btn_layout = QHBoxLayout()
+        self.run_btn = QPushButton("Запустить Speedtest")
+        self.run_btn.clicked.connect(self.run_speedtest_gui)
+        btn_layout.addWidget(self.run_btn)
+
+        self.clear_btn = QPushButton("Очистить логи")
+        self.clear_btn.clicked.connect(self.clear_logs)
+        btn_layout.addWidget(self.clear_btn)
+
+        layout.addLayout(btn_layout)
+
         self.setLayout(layout)
-        
+
+    @Slot(str)
     def append_log(self, message):
-        self.log_display.appendPlainText(f"{datetime.now().strftime('%H:%M:%S')} - {message}")
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        self.log_display.appendPlainText(f"{timestamp} - {message}")
         cursor = self.log_display.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self.log_display.setTextCursor(cursor)
-        
+
     def clear_logs(self):
         self.log_display.clear()
 
+    def run_speedtest_gui(self):
+        host = self.proxy_host_input.text().strip()
+        try:
+            port = int(self.proxy_port_input.text().strip())
+        except ValueError:
+            self.append_log("Ошибка: порт должен быть числом")
+            return
+
+        self.append_log(f"Запуск speedtest через прокси {host}:{port}...")
+
+        def speedtest_task():
+            def log(msg):
+                self.log_signal.emit(msg)
+
+            try:
+                log("Настройка SOCKS5 прокси...")
+                socks.set_default_proxy(socks.SOCKS5, host, port)
+                socket.socket = socks.socksocket
+
+                log("Инициализация Speedtest...")
+                st = speedtest.Speedtest()
+
+                try:
+                    log("Выбор лучшего сервера...")
+                    best = st.get_best_server()
+                    log(f"Выбран сервер: {best['host']} ({best['sponsor']}) с расстоянием {best['d']} km")
+                except Exception as e:
+                    log(f"Не удалось выбрать сервер через прокси: {e}")
+                    log("Тестирование не может быть продолжено.")
+                    return
+
+                try:
+                    log("Запуск теста загрузки...")
+                    download_speed = st.download()
+                    log(f"Download raw: {download_speed} бит/с")
+                except Exception as e:
+                    download_speed = 0
+                    log(f"Ошибка при загрузке: {e}")
+
+                try:
+                    log("Запуск теста выгрузки...")
+                    upload_speed = st.upload()
+                    log(f"Upload raw: {upload_speed} бит/с")
+                except Exception as e:
+                    upload_speed = 0
+                    log(f"Ошибка при выгрузке: {e}")
+
+                try:
+                    ping = st.results.ping or 0
+                    log(f"Ping: {ping} ms")
+                except Exception as e:
+                    ping = 0
+                    log(f"Ошибка получения ping: {e}")
+
+                download_mbps = round(download_speed / 1e6, 2)
+                upload_mbps = round(upload_speed / 1e6, 2)
+                log(f"Результаты: Download={download_mbps} Mbps, Upload={upload_mbps} Mbps, Ping={ping} ms")
+
+            except Exception as e:
+                log(f"Критическая ошибка теста: {e}")
+
+        threading.Thread(target=speedtest_task, daemon=True).start()
+    
 class BaseWizardPage(QWizardPage):
     def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager):
         super().__init__()
@@ -1732,6 +1840,9 @@ class TestWorker(QObject):
         
     def run_test(self):
         try:
+            self.stop_xray_completely()
+            time.sleep(1)
+            
             self.log_message.emit("Начинаем тестирование конфигурации...")
             
             if not self.generated_config:
@@ -1830,6 +1941,17 @@ class TestWorker(QObject):
             json.dump(config, self.temp_config, indent=2)
             self.temp_config.flush()
             self.temp_config.close()
+
+            def is_port_in_use(port):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    return s.connect_ex(('localhost', port)) == 0
+            
+            for i in range(10):
+                if not is_port_in_use(3080):
+                    break
+                time.sleep(0.5)
+            else:
+                self.log_message.emit("Предупреждение: порт 3080 все еще занят")
 
             xray_path = self.find_xray()
             if not xray_path:
@@ -1978,13 +2100,7 @@ class TestWorker(QObject):
 
     def cleanup(self):
         try:
-            if self.xray_process:
-                self.xray_process.terminate()
-                try:
-                    self.xray_process.wait(timeout=3)
-                except:
-                    self.xray_process.kill()
-                self.xray_process = None
+            self.stop_xray_completely()
         except:
             pass
         
@@ -1995,56 +2111,77 @@ class TestWorker(QObject):
         except:
             pass
 
-    def run_speedtest(self):
-        try:
-            self.speedtest_log.emit("=== НАЧАЛО ТЕСТА СКОРОСТИ ===")
-            self.speedtest_log.emit("Настраиваем SOCKS5 прокси для speedtest (127.0.0.1:3080)...")
+    def run_speedtest(self, proxy_host="127.0.0.1", proxy_port=3080):
+        result = {"ping": 0, "download": 0, "upload": 0}
     
-            os.environ['ALL_PROXY'] = 'socks5://127.0.0.1:3080'
-            os.environ['HTTP_PROXY'] = 'socks5://127.0.0.1:3080'
-            os.environ['HTTPS_PROXY'] = 'socks5://127.0.0.1:3080'
+        def log(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            self.speedtest_log.emit(f"{timestamp} - {msg}")
     
-            self.speedtest_log.emit("Создаем объект Speedtest...")
-            st = speedtest.Speedtest()
+        def wait_for_proxy(host, port, timeout=10):
+            """Ждём, пока Xray начнёт слушать порт"""
+            import socket
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    with socket.create_connection((host, port), timeout=1):
+                        return True
+                except OSError:
+                    time.sleep(0.3)
+            return False
     
-            self.speedtest_log.emit("Ищем лучший сервер...")
-            best = st.get_best_server()
-            ping = best.get('latency', 0) if best else 0
-            if best:
-                self.speedtest_log.emit(f"Найден сервер: {best.get('host')} ({best.get('sponsor')})")
-                self.speedtest_log.emit(f"Локация: {best.get('name', 'N/A')}, {best.get('country', 'N/A')}")
-            else:
-                self.speedtest_log.emit("Не удалось найти сервер")
-                return None
+        def task():
+            nonlocal result
+            try:
+                log(f"Ожидание запуска SOCKS5 прокси на {proxy_host}:{proxy_port}...")
+                if not wait_for_proxy(proxy_host, proxy_port, timeout=15):
+                    log("Ошибка: прокси не ответил в течение 15 секунд.")
+                    return
     
-            self.speedtest_log.emit("Измеряем скорость СКАЧИВАНИЯ...")
-            download_bps = st.download()
-            download_mbps = download_bps / 1_000_000
-            self.speedtest_log.emit(f"Download: {download_mbps:.2f} Мбит/с")
+                log(f"Прокси доступен. Настройка окружения для Speedtest...")
+                os.environ["HTTP_PROXY"] = f"socks5://{proxy_host}:{proxy_port}"
+                os.environ["HTTPS_PROXY"] = f"socks5://{proxy_host}:{proxy_port}"
     
-            self.speedtest_log.emit("Измеряем скорость ЗАГРУЗКИ...")
-            upload_bps = st.upload(pre_allocate=False)
-            upload_mbps = upload_bps / 1_000_000
-            self.speedtest_log.emit(f"Upload: {upload_mbps:.2f} Мбит/с")
+                log("Инициализация Speedtest...")
+                st = speedtest.Speedtest()
     
-            self.speedtest_log.emit(f"Пинг: {ping:.2f} мс")
-            self.speedtest_log.emit("=== ТЕСТ ЗАВЕРШЕН ===")
+                log("Получение списка серверов...")
+                st.get_servers()
+                log("Выбор лучшего сервера...")
+                best = st.get_best_server()
+                log(f"Выбран сервер: {best['host']} ({best['sponsor']})")
     
-            return {
-                "ping": ping,
-                "download": download_mbps,
-                "upload": upload_mbps
-            }
+                log("Запуск теста загрузки...")
+                download_speed = st.download()
+                log(f"Download raw: {download_speed} бит/с")
     
-        except Exception as e:
-            self.speedtest_log.emit(f"Ошибка Speedtest: {e}")
-            import traceback
-            self.speedtest_log.emit(traceback.format_exc())
-            return None
-        finally:
-            for var in ['ALL_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY']:
-                if var in os.environ:
-                    del os.environ[var]
+                log("Запуск теста выгрузки...")
+                upload_speed = st.upload()
+                log(f"Upload raw: {upload_speed} бит/с")
+    
+                ping = st.results.ping or 0
+                log(f"Ping: {ping} ms")
+    
+                download_mbps = round((download_speed or 0) / 1e6, 2)
+                upload_mbps = round((upload_speed or 0) / 1e6, 2)
+    
+                result = {
+                    "ping": ping,
+                    "download": download_mbps,
+                    "upload": upload_mbps
+                }
+    
+                log(f"Результаты: Download={download_mbps} Mbps, Upload={upload_mbps} Mbps, Ping={ping} ms")
+    
+            except Exception as e:
+                log(f"Ошибка при запуске Speedtest: {e}")
+                result = {"ping": 0, "download": 0, "upload": 0}
+    
+        thread = threading.Thread(target=task, daemon=True)
+        thread.start()
+        thread.join()
+    
+        return result
 
     def find_xray(self):
         possible_paths = [
@@ -2068,6 +2205,25 @@ class TestWorker(QObject):
             pass
             
         return None
+    
+    def stop_xray_completely(self):
+        if self.xray_process:
+            try:
+                self.xray_process.terminate()
+                self.xray_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    self.xray_process.kill()
+                    self.xray_process.wait(timeout=3)
+                except:
+                    pass
+            finally:
+                self.xray_process = None
+        
+        if os.name == 'nt':
+            os.system('taskkill /f /im xray.exe 2>nul')
+        else:
+            os.system('pkill -f xray 2>/dev/null')
 
 class PageInbound(BaseWizardPage):
     test_log_signal = Signal(str)
@@ -2093,8 +2249,8 @@ class PageInbound(BaseWizardPage):
         
         self.info_label = QLabel(
             "Инструкции по настройке и использованию VPN-приложений доступны "
-            "<a href='https://wiki.yukikras.net/ru/nastroikavpn'>здесь</a>.<br>"
-            "Автоподбор настроек находится в статусе БЕТА, рекомендуется подбирать SNI вручную."
+            "<a href='https://wiki.yukikras.net/ru/nastroikavpn'>здесь</a>."
+            #"Автоподбор настроек находится в статусе БЕТА, рекомендуется подбирать SNI вручную."
         )
         self.info_label.setOpenExternalLinks(True)
         
@@ -2103,26 +2259,26 @@ class PageInbound(BaseWizardPage):
         self.status_label = QLabel("Настройка Vless Reality подключения")
         layout.addWidget(self.status_label)
         
-        auto_test_layout = QHBoxLayout()
-        auto_test_label = QLabel("Статус автоподбора:")
-        self.auto_test_status = QLabel("ОЖИДАНИЕ")
-        self.auto_test_status.setStyleSheet("""
-            QLabel {
-                padding: 4px 8px;
-                border-radius: 4px;
-                background-color: #6c757d;
-                color: white;
-                font-weight: bold;
-            }
-        """)
-        self.auto_test_status.setAlignment(Qt.AlignCenter)
-        self.auto_test_status.setMinimumWidth(120)
-        
-        auto_test_layout.addWidget(auto_test_label)
-        auto_test_layout.addWidget(self.auto_test_status)
-        auto_test_layout.addStretch()
-        
-        layout.addLayout(auto_test_layout)
+        #auto_test_layout = QHBoxLayout()
+        #auto_test_label = QLabel("Статус автоподбора:")
+        #self.auto_test_status = QLabel("ОЖИДАНИЕ")
+        #self.auto_test_status.setStyleSheet("""
+        #    QLabel {
+        #        padding: 4px 8px;
+        #        border-radius: 4px;
+        #        background-color: #6c757d;
+        #        color: white;
+        #        font-weight: bold;
+        #    }
+        #""")
+        #self.auto_test_status.setAlignment(Qt.AlignCenter)
+        #self.auto_test_status.setMinimumWidth(120)
+
+        #auto_test_layout.addWidget(auto_test_label)
+        #auto_test_layout.addWidget(self.auto_test_status)
+        #auto_test_layout.addStretch()
+
+        #layout.addLayout(auto_test_layout)
         
         self.sni_info_label = QLabel("")
         self.sni_info_label.setWordWrap(True)
@@ -2140,55 +2296,61 @@ class PageInbound(BaseWizardPage):
         self.qr_btn = QPushButton("Показать QR код")
         self.qr_btn.clicked.connect(self.show_qr_code)
         
-        self.regenerate_btn = QPushButton("Сгенерировать ключ")
-        self.regenerate_btn.clicked.connect(self.regenerate_vless)
+        #self.test_btn = QPushButton("Протестировать")
+        #self.test_btn.clicked.connect(self.test_vless_config)
         
-        self.test_btn = QPushButton("Протестировать")
-        self.test_btn.clicked.connect(self.test_vless_config)
+        self.refresh_sni_btn = QPushButton("Переполучить список SNI")
+        self.refresh_sni_btn.clicked.connect(self.refresh_sni_list)
         
         btn_layout1.addWidget(self.copy_btn)
         btn_layout1.addWidget(self.qr_btn)
-        btn_layout1.addWidget(self.regenerate_btn)
-        btn_layout1.addWidget(self.test_btn)
+        btn_layout1.addWidget(self.refresh_sni_btn)
+        #btn_layout1.addWidget(self.test_btn)
         
         self.test_group = QGroupBox("Тестирование конфигурации")
         test_layout = QVBoxLayout(self.test_group)
-        
+
         test_options_layout = QHBoxLayout()
         self.test_type_group = QButtonGroup(self)
-        
-        self.speed_test_radio = QRadioButton("Тест скорости")
-        self.speed_test_radio.setChecked(True)
-        self.url_test_radio = QRadioButton("URL тест")
-        
-        self.test_type_group.addButton(self.speed_test_radio)
-        self.test_type_group.addButton(self.url_test_radio)
-        
-        test_options_layout.addWidget(self.speed_test_radio)
-        test_options_layout.addWidget(self.url_test_radio)
+
+        #self.speed_test_radio = QRadioButton("Тест скорости")
+        #self.speed_test_radio.setChecked(True)
+        #self.url_test_radio = QRadioButton("URL тест")
+
+        #self.test_type_group.addButton(self.speed_test_radio)
+        #self.test_type_group.addButton(self.url_test_radio)
+
+        #test_options_layout.addWidget(self.speed_test_radio)
+        #test_options_layout.addWidget(self.url_test_radio)
         test_options_layout.addStretch()
-        
+
         self.test_log_display = QPlainTextEdit()
         self.test_log_display.setMaximumHeight(150)
         self.test_log_display.setReadOnly(True)
-        
+
         test_layout.addLayout(test_options_layout)
         test_layout.addWidget(self.test_log_display)
-        
+
         self.test_actions_layout = QHBoxLayout()
         #self.work_btn = QPushButton("Работает - завершить работу мастера")
         #self.work_btn.clicked.connect(self.config_works)
-        self.not_work_btn = QPushButton("Настроить (VPN) Vless автоматически")
-        self.not_work_btn.clicked.connect(self.start_auto_configuration)
-        
+        #self.not_work_btn = QPushButton("Настроить (VPN) Vless автоматически")
+        #self.not_work_btn.clicked.connect(self.start_auto_configuration)
+
         #self.test_actions_layout.addWidget(self.work_btn)
-        self.test_actions_layout.addWidget(self.not_work_btn)
-        
+        #self.test_actions_layout.addWidget(self.not_work_btn)
+
         layout.addWidget(self.vless_label)
         layout.addWidget(self.vless_display)
         layout.addLayout(btn_layout1)
         layout.addWidget(self.test_group)
         layout.addLayout(self.test_actions_layout)
+        
+        btn_layout_bottom = QHBoxLayout()
+        self.regenerate_btn = QPushButton("Не работает VPN - сгенерировать Vless ключ")
+        self.regenerate_btn.clicked.connect(self.regenerate_vless)
+        btn_layout_bottom.addWidget(self.regenerate_btn)
+        layout.addLayout(btn_layout_bottom)
         
         self.setLayout(layout)
         
@@ -2214,24 +2376,75 @@ class PageInbound(BaseWizardPage):
 
         self.setup_shortcuts()
 
-    def update_auto_test_status(self, status, color):
-        """Обновляет статус автотестирования с указанным цветом"""
-        status_texts = {
-            "waiting": "ОЖИДАНИЕ",
-            "testing": "Идёт автоматический подбор настроек, пожалуйста ожидайте.",
-            "success": "УСПЕХ"
-        }
+    def refresh_sni_list(self):
+        self.status_label.setText("Обновление списка SNI...")
+        self.add_test_log("Запрашиваем обновление списка SNI")
         
-        self.auto_test_status.setText(status_texts[status])
-        self.auto_test_status.setStyleSheet(f"""
-            QLabel {{
-                padding: 4px 8px;
-                border-radius: 4px;
-                background-color: {color};
-                color: white;
-                font-weight: bold;
-            }}
-        """)
+        progress_dialog = QProgressDialog("Обновление списка SNI...", "Отмена", 0, 0, self)
+        progress_dialog.setWindowTitle("Обновление SNI")
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.show()
+        
+        def refresh_worker():
+            try:
+                success = self.sni_manager.refresh_sni_list()
+                
+                QMetaObject.invokeMethod(self, "_on_sni_refresh_completed", 
+                                       Qt.QueuedConnection,
+                                       Q_ARG(bool, success))
+            except Exception as e:
+                QMetaObject.invokeMethod(self, "_on_sni_refresh_error", 
+                                       Qt.QueuedConnection,
+                                       Q_ARG(str, str(e)))
+            finally:
+                QMetaObject.invokeMethod(progress_dialog, "close", Qt.QueuedConnection)
+        
+        threading.Thread(target=refresh_worker, daemon=True).start()
+    
+    @Slot(bool)
+    def _on_sni_refresh_completed(self, success):
+        if success:
+            self.update_sni_info()
+            self.status_label.setText("Список SNI успешно обновлен")
+            self.add_test_log("Список SNI успешно обновлен")
+            
+            used_count = self.sni_manager.get_used_count()
+            available_count = self.sni_manager.get_available_count()
+            total_count = self.sni_manager.get_total_count()
+            
+            QMessageBox.information(self, "Обновление завершено", 
+                                  f"Список SNI успешно обновлен!\n\n"
+                                  f"Всего SNI: {total_count}\n"
+                                  f"Доступно: {available_count}\n"
+                                  f"Использовано: {used_count}")
+        else:
+            self.status_label.setText("Ошибка обновления списка SNI")
+            self.add_test_log("Ошибка при обновлении списка SNI")
+    
+    @Slot(str)
+    def _on_sni_refresh_error(self, error_message):
+        self.status_label.setText("Ошибка обновления списка SNI")
+        self.add_test_log(f"Ошибка обновления SNI: {error_message}")
+        QMessageBox.warning(self, "Ошибка", 
+                           f"Не удалось обновить список SNI:\n{error_message}")
+    
+    #def update_auto_test_status(self, status, color):
+    #    status_texts = {
+    #        "waiting": "ОЖИДАНИЕ",
+    #        "testing": "Идёт автоматический подбор настроек, пожалуйста ожидайте.",
+    #        "success": "УСПЕХ"
+    #    }
+    #    
+    #    self.auto_test_status.setText(status_texts[status])
+    #    self.auto_test_status.setStyleSheet(f"""
+    #        QLabel {{
+    #            padding: 4px 8px;
+    #            border-radius: 4px;
+    #            background-color: {color};
+    #            color: white;
+    #            font-weight: bold;
+    #        }}
+    #    """)
 
     def setup_shortcuts(self):
         shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
@@ -2262,6 +2475,10 @@ class PageInbound(BaseWizardPage):
 
     def _regenerate_vless_worker(self):
         try:
+            if not self.current_inbound_id:
+                self._emit_test_log("Проверяем существующие inbound...")
+                self._check_existing_inbound_sync()
+            
             priv_key, pub_key = self._get_keys()
             if not priv_key or not pub_key:
                 self._emit_test_log("Не удалось получить ключи")
@@ -2287,6 +2504,41 @@ class PageInbound(BaseWizardPage):
                 
         except Exception as e:
             self._emit_test_log(f"Ошибка генерации: {e}")
+    
+    def _check_existing_inbound_sync(self):
+        try:
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
+            
+            cmd_list = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
+            
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd_list)
+            
+            if exit_code != 0:
+                raise Exception(f"Ошибка curl: {err}")
+            
+            cleaned_out = self.clean_json_response(out)
+            result = json.loads(cleaned_out)
+            
+            if result.get('success'):
+                inbounds = result.get('obj', [])
+                
+                for inbound in inbounds:
+                    if inbound.get('port') == 443:
+                        self.current_inbound_id = inbound.get('id')
+                        self.existing_clients = self.get_existing_clients(inbound)
+                        self._emit_test_log(f"Найден существующий inbound-443 с ID: {self.current_inbound_id}")
+                        return True
+                
+                self._emit_test_log("Inbound на порту 443 не найден, будет создан новый")
+                return False
+            else:
+                raise Exception(f"API ошибка: {result.get('msg', 'Unknown error')}")
+                
+        except Exception as e:
+            self._emit_test_log(f"Ошибка проверки существующего inbound: {e}")
+            return False
 
     @Slot(str)
     def _update_status_success(self, message):
@@ -2307,9 +2559,9 @@ class PageInbound(BaseWizardPage):
     def start_auto_configuration(self):
         if self.auto_config_in_progress:
             self.auto_config_stop = True
-            self.not_work_btn.setText("Настроить (VPN) Vless")
+            #self.not_work_btn.setText("Настроить (VPN) Vless")
             self.auto_config_in_progress = False
-            self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
+            #self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
             self.add_test_log("Авто-подбор остановлен")
             
             if self.test_worker:
@@ -2322,8 +2574,8 @@ class PageInbound(BaseWizardPage):
             
         self.auto_config_in_progress = True
         self.auto_config_stop = False
-        self.not_work_btn.setText("Остановить авто-подбор")
-        self.update_auto_test_status("testing", "#ffc107")  # Желтый - подбор
+        #self.not_work_btn.setText("Остановить авто-подбор")
+        #self.update_auto_test_status("testing", "#ffc107")  # Желтый - подбор
         self.clear_test_log()
         self.add_test_log("Запуск автоматического подбора SNI...")
         self.add_test_log("Ищем рабочий SNI")
@@ -2337,6 +2589,10 @@ class PageInbound(BaseWizardPage):
             test_count += 1
             self._emit_test_log(f"Попытка #{test_count}")
             
+            if self.test_worker:
+                self.test_worker.stop_xray_completely()
+                time.sleep(2)
+            
             sni = self.get_next_sni()
             if not sni:
                 self._emit_test_log("Нет доступных SNI для тестирования")
@@ -2349,7 +2605,7 @@ class PageInbound(BaseWizardPage):
                 self._emit_test_log(f"Ошибка обновления конфигурации для SNI: {sni}")
                 continue
                 
-            time.sleep(3)
+            time.sleep(5)
             
             if self.auto_config_stop:
                 break
@@ -2390,16 +2646,16 @@ class PageInbound(BaseWizardPage):
         download_speed = self.current_stats.get('download', 0)
         upload_speed = self.current_stats.get('upload', 0)
         self.status_label.setText(f"Авто-подбор успешно завершен, скопируйте Vless ключ")
-        self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
+        #self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
         self.auto_config_in_progress = False
-        self.not_work_btn.setText("Настроить (VPN) Vless")
+        #self.not_work_btn.setText("Настроить (VPN) Vless")
         self.add_test_log("Авто-подбор успешно завершен!")
 
     @Slot()
     def _on_auto_config_finished(self):
         self.auto_config_in_progress = False
-        self.not_work_btn.setText("Настроить (VPN) Vless")
-        self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
+        #self.not_work_btn.setText("Настроить (VPN) Vless")
+        #self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
         self.status_label.setText("Авто-подбор завершен")
         self.add_test_log("Авто-подбор завершен")
 
@@ -2678,7 +2934,12 @@ class PageInbound(BaseWizardPage):
     def _test_configuration_speed(self):
         if not self.generated_config:
             return False
-            
+        
+        if self.test_worker:
+            self.test_worker.stop_xray_completely()
+        
+        time.sleep(2)
+        
         loop = QEventLoop()
         test_success = [False]
         
@@ -2711,7 +2972,7 @@ class PageInbound(BaseWizardPage):
             return
             
         self.testing_in_progress = True
-        self.test_btn.setEnabled(False)
+        #self.test_btn.setEnabled(False)
         
         self.test_thread = QThread()
         self.test_worker = TestWorker(self.generated_config, test_type)
@@ -2732,7 +2993,7 @@ class PageInbound(BaseWizardPage):
     def _on_test_thread_finished(self):
         self.test_thread.deleteLater()
         self.testing_in_progress = False
-        self.test_btn.setEnabled(True)
+        #self.test_btn.setEnabled(True)
 
     @Slot(dict)
     def on_test_completed(self, stats):
@@ -2743,7 +3004,7 @@ class PageInbound(BaseWizardPage):
         self.panel_info = self.page_auth.get_panel_info()
         self.cookie_jar = self.panel_info.get('cookie_jar', '')
         
-        self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
+        #self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
         
         if self.ssh_mgr.client:
             transport = self.ssh_mgr.client.get_transport()
@@ -2855,17 +3116,17 @@ class PageInbound(BaseWizardPage):
         else:
             self.status_label.setText(f"Ошибка: {error_message}")
 
-    def test_vless_config(self):
-        if not self.generated_config:
-            self.add_test_log("Ошибка: нет конфигурации для тестирования")
-            return
-    
-        if self.testing_in_progress:
-            self.add_test_log("Тестирование уже выполняется...")
-            return
-    
-        test_type = "speed" if self.speed_test_radio.isChecked() else "url"
-        self.start_test_thread(test_type)
+    #def test_vless_config(self):
+    #    if not self.generated_config:
+    #        self.add_test_log("Ошибка: нет конфигурации для тестирования")
+    #        return
+    #
+    #    if self.testing_in_progress:
+    #        self.add_test_log("Тестирование уже выполняется...")
+    #        return
+    #
+    #    test_type = "speed" if self.speed_test_radio.isChecked() else "url"
+    #    self.start_test_thread(test_type)
 
     def config_works(self):
         self.auto_config_stop = True
@@ -2874,8 +3135,8 @@ class PageInbound(BaseWizardPage):
         if self.test_worker:
             self.test_worker.stop()
             
-        self.not_work_btn.setText("Настроить (VPN) Vless")
-        self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
+        #self.not_work_btn.setText("Настроить (VPN) Vless")
+        #self.update_auto_test_status("success", "#28a745")  # Зеленый - успех
         self.status_label.setText("Конфигурация работает! Настройка завершена.")
         self.add_test_log("Конфигурация подтверждена - работает корректно")
         self.log_message("Настройка завершена успешно!")
@@ -2901,7 +3162,7 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-CURRENT_VERSION = "1.1.2"
+CURRENT_VERSION = "1.1.3"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
@@ -2935,7 +3196,7 @@ class XUIWizard(QWizard):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Vless Wizard")
-        self.resize(590, 510)
+        self.resize(500, 500)
         
         self.log_window = LogWindow()
         self.ssh_mgr = SSHManager()

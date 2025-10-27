@@ -74,6 +74,7 @@ WEBPATH=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
 SERVER_IP=$(hostname -I | awk '{print $1}')
 
 systemctl restart x-ui
+x-ui enable
 
 {
     echo -e "\nПанель 3x-ui доступна по ссылке: http://$SERVER_IP:8080/$WEBPATH"
