@@ -1037,7 +1037,7 @@ class PagePanelAuth(BaseWizardPage):
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setText(
-            "Предупреждение! Wizard на следующему шагу будет<br>"
+            "Предупреждение! Wizard на следующем шагу будет<br>"
             "менять некоторые настройки в 3x-ui панели!<br><br>"
             "Если у вас настроена 2FA аутентификация в 3x-ui, пожалуйста, временно отключите её.<br><br>"
             "В случае Aéza логин и пароль для 3x-ui панели можно найти следуя инструкциям "
@@ -1073,20 +1073,6 @@ class PagePanelAuth(BaseWizardPage):
         self.cancel_auto_fill_btn.setVisible(False)
         self._show_input_fields(True)
         self._restore_wizard_buttons()
-        self.show_input_prompt()
-
-    def show_input_prompt(self):
-        prompt_text = (
-            "Пожалуйста, введите данные для входа в 3x-ui панель:\n\n"
-            "• URL адрес панели (например: http://ip-адрес:порт/путь)\n"
-            "• Логин администратора\n"
-            "• Пароль администратора\n\n"
-            "Эти данные обычно создаются при установке 3x-ui и могут быть найдены:\n"
-            "- В файле /root/3x-ui.txt на сервере\n"
-            "- В выводе установки 3x-ui\n"
-            "- В письме от хостинг-провайдера (для Aéza и подобных)"
-        )
-        self.status_label.setText(prompt_text)
 
     def initializePage(self):
         creds = self.page_install.get_credentials()
@@ -1250,14 +1236,12 @@ class PagePanelAuth(BaseWizardPage):
         if self.wizard().page(current_id) == current_page:
             self.wizard().next()
 
-
     @Slot()
     def _on_auto_fill_auth_failed(self):
         self.progress_bar.setVisible(False)
         self.cancel_auto_fill_btn.setVisible(False)
         self._show_input_fields(True)
         self._restore_wizard_buttons()
-        self.show_input_prompt()
 
     @Slot()
     def _on_auto_fill_failed(self):
@@ -1265,7 +1249,6 @@ class PagePanelAuth(BaseWizardPage):
         self.cancel_auto_fill_btn.setVisible(False)
         self._show_input_fields(True)
         self._restore_wizard_buttons()
-        self.show_input_prompt()
 
     @Slot(str)
     def _on_auto_fill_error(self, error_msg):
@@ -1274,7 +1257,6 @@ class PagePanelAuth(BaseWizardPage):
         self._show_input_fields(True)
         self._restore_wizard_buttons()
         self.status_label.setText(f"Ошибка при автоматическом заполнении\n\nПожалуйста, введите данные для входа вручную.")
-        self.show_input_prompt()
 
     def parse_credentials_from_content(self, content):
         credentials = {}
@@ -1429,7 +1411,7 @@ class PagePanelAuth(BaseWizardPage):
         return self.panel_info
 
     def isComplete(self):
-        return self.auth_successful
+        return True
     
     def nextId(self):
         return 3
