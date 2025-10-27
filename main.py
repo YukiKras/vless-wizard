@@ -588,6 +588,8 @@ class PageInstallXUI(BaseWizardPage):
         self.panel_credentials = {}
         self.installation_complete = False
         self.force_install = False
+        self.install_thread = None
+        self.stop_installation = False
 
     def copy_credentials(self):
         if self.panel_credentials:
@@ -710,9 +712,14 @@ class PageInstallXUI(BaseWizardPage):
         self.progress_bar.setRange(0, 0)
         
         self.force_install = False
+        self.stop_installation = False
         
-        t = threading.Thread(target=self.install_xui, daemon=True)
-        t.start()
+        if self.install_thread and self.install_thread.is_alive():
+            self.log_message("[install] Предыдущая установка еще выполняется, ожидаем...")
+            return
+            
+        self.install_thread = threading.Thread(target=self.install_xui, daemon=True)
+        self.install_thread.start()
 
     def safe_show_install_dialog(self):
         QMetaObject.invokeMethod(self, "_show_install_dialog_impl")
@@ -736,60 +743,164 @@ class PageInstallXUI(BaseWizardPage):
         self.start_xui_installation()
 
     def install_xui(self):
-        self.safe_update_status("Установка 3x-ui...")
-        self.log_message("[install] Начинаем установку 3x-ui...")
-    
-        script_path = resource_path("3xinstall.sh")
-        if not script_path.exists():
-            self.log_message("[install] Ошибка: файл 3xinstall.sh не найден")
-            self.safe_update_status("Ошибка: 3xinstall.sh не найден")
+        """Основной метод установки с улучшенной обработкой ошибок"""
+        try:
+            self.safe_update_status("Подготовка к установке 3x-ui...")
+            self.log_message("[install] Начинаем установку 3x-ui...")
+        
+            # Проверяем соединение перед началом
+            if not self.ensure_ssh_connection():
+                self.log_message("[install] Ошибка: нет SSH соединения")
+                self.safe_update_status("Ошибка: нет SSH соединения")
+                self.safe_hide_progress()
+                return
+        
+            script_path = resource_path("3xinstall.sh")
+            if not script_path.exists():
+                self.log_message("[install] Ошибка: файл 3xinstall.sh не найден")
+                self.safe_update_status("Ошибка: 3xinstall.sh не найден")
+                self.safe_hide_progress()
+                return
+        
+            remote_script = f"/tmp/3xinstall_{secrets.token_hex(4)}.sh"
+            remote_log = f"/tmp/xui_install_{secrets.token_hex(4)}.log"
+        
+            # Загружаем файл с повторными попытками
+            if not self.upload_with_retry(str(script_path), remote_script):
+                self.log_message("[install] Ошибка загрузки скрипта установки")
+                self.safe_update_status("Ошибка загрузки скрипта")
+                self.safe_hide_progress()
+                return
+        
+            # Даем права на выполнение
+            self.ssh_mgr.exec_command(f"chmod +x {remote_script}")
+        
+            # Проверяем наличие screen и устанавливаем если нужно
+            exit_code, out, err = self.ssh_mgr.exec_command("command -v screen || echo 'NO_SCREEN'")
+            if "NO_SCREEN" in out:
+                self.log_message("[install] Устанавливаем screen...")
+                self.ssh_mgr.exec_command("apt-get update && apt-get install -y screen || yum install -y screen || dnf install -y screen")
+        
+            # Запускаем установку в screen
+            screen_name = f"xui_{secrets.token_hex(3)}"
+            self.log_message(f"[install] Запускаем установку в screen сессии {screen_name}...")
+            
+            cmd = f"screen -dmS {screen_name} bash -c 'bash {remote_script} > {remote_log} 2>&1; echo __XUI_DONE__ >> {remote_log}'"
+            self.ssh_mgr.exec_command(cmd)
+        
+            # Мониторим лог установки
+            self.follow_install_log(remote_log, screen_name)
+            
+        except Exception as e:
+            self.log_message(f"[install error] Критическая ошибка: {e}")
+            self.safe_update_status(f"Ошибка установки: {e}")
             self.safe_hide_progress()
-            return
-    
-        remote_script = f"/tmp/3xinstall_{secrets.token_hex(4)}.sh"
-        remote_log = f"/tmp/xui_install_{secrets.token_hex(4)}.log"
-    
-        self.ssh_mgr.upload_file(str(script_path), remote_script)
-    
-        exit_code, out, err = self.ssh_mgr.exec_command("command -v screen || echo 'NO_SCREEN'")
-        if "NO_SCREEN" in out:
-            self.ssh_mgr.exec_command("apt-get update && apt-get install -y screen || yum install -y screen")
-    
-        screen_name = f"xui_{secrets.token_hex(3)}"
-        self.ssh_mgr.exec_command(
-            f"screen -dmS {screen_name} bash -c 'bash {remote_script} > {remote_log} 2>&1; echo __XUI_DONE__ >> {remote_log}; exec bash'"
-        )
-    
-        def follow_log():
-            seen_lines = set()
-            done = False
-            while not done:
-                try:
-                    if not self.ensure_ssh_connection():
-                        self.log_message("[SSH] Соединение потеряно, переподключаемся...")
-                        time.sleep(2)
-                        continue
-    
-                    exit_code, out, err = self.ssh_mgr.exec_command(f"tail -n 50 {remote_log}")
-                    for line in out.splitlines():
-                        if line in seen_lines:
-                            continue
-                        seen_lines.add(line)
+
+    def upload_with_retry(self, local_path, remote_path, max_retries=3):
+        """Загрузка файла с повторными попытками при разрыве соединения"""
+        for attempt in range(max_retries):
+            try:
+                if not self.ensure_ssh_connection():
+                    self.log_message(f"[upload] Попытка {attempt + 1}: нет соединения")
+                    continue
+                    
+                self.log_message(f"[upload] Попытка {attempt + 1} загрузки {local_path}...")
+                self.ssh_mgr.upload_file(local_path, remote_path)
+                self.log_message(f"[upload] Файл успешно загружен как {remote_path}")
+                return True
+                
+            except Exception as e:
+                self.log_message(f"[upload] Ошибка попытки {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                else:
+                    self.log_message("[upload] Все попытки загрузки провалились")
+                    return False
+        return False
+
+    def follow_install_log(self, remote_log, screen_name):
+        """Мониторинг лога установки с обработкой разрывов соединения"""
+        seen_lines = set()
+        last_size = 0
+        consecutive_errors = 0
+        max_errors = 5
+        
+        self.log_message("[log] Начинаем мониторинг лога установки...")
+        
+        while not self.stop_installation and consecutive_errors < max_errors:
+            try:
+                if not self.ensure_ssh_connection():
+                    self.log_message("[log] Нет соединения, пробуем переподключиться...")
+                    consecutive_errors += 1
+                    time.sleep(3)
+                    continue
+                
+                # Проверяем статус screen сессии
+                exit_code, out, err = self.ssh_mgr.exec_command(f"screen -list | grep {screen_name} || echo 'NOT_FOUND'")
+                
+                if "NOT_FOUND" in out:
+                    self.log_message("[log] Screen сессия завершена, проверяем результат...")
+                    break
+                
+                # Читаем лог
+                exit_code, out, err = self.ssh_mgr.exec_command(f"tail -c +{last_size + 1} {remote_log} 2>/dev/null || echo ''")
+                
+                if out:
+                    lines = out.splitlines()
+                    for line in lines:
+                        if line and line not in seen_lines:
+                            seen_lines.add(line)
+                            self.safe_parse_credentials(line)
+                            self.log_message(line)
+                            
+                            if "__XUI_DONE__" in line:
+                                self.log_message("[log] Обнаружен маркер завершения установки")
+                                break
+                    
+                    # Обновляем размер для следующего чтения
+                    exit_code, size_out, err = self.ssh_mgr.exec_command(f"stat -c%s {remote_log} 2>/dev/null || wc -c < {remote_log} 2>/dev/null || echo '0'")
+                    if size_out.strip().isdigit():
+                        last_size = int(size_out.strip())
+                
+                consecutive_errors = 0  # Сброс счетчика ошибок при успешной операции
+                time.sleep(2)
+                
+            except Exception as e:
+                consecutive_errors += 1
+                self.log_message(f"[log error] Ошибка чтения лога ({consecutive_errors}/{max_errors}): {e}")
+                time.sleep(3)
+        
+        if consecutive_errors >= max_errors:
+            self.log_message("[log] Превышено максимальное количество ошибок, завершаем мониторинг")
+            self.safe_update_status("Ошибка: слишком много разрывов соединения")
+        
+        # Финальная проверка и завершение
+        self.finalize_installation_check(remote_log, screen_name)
+
+    def finalize_installation_check(self, remote_log, screen_name):
+        """Финальная проверка результатов установки"""
+        try:
+            self.log_message("[finalize] Завершаем установку...")
+            
+            # Читаем полный лог для поиска credentials
+            if self.ensure_ssh_connection():
+                exit_code, out, err = self.ssh_mgr.exec_command(f"cat {remote_log} 2>/dev/null || echo 'NO_LOG'")
+                if "NO_LOG" not in out:
+                    lines = out.splitlines()
+                    for line in lines:
                         self.safe_parse_credentials(line)
-                        self.log_message(line)
-                        if "__XUI_DONE__" in line:
-                            done = True
-                            break
-                    time.sleep(1)
-                except Exception as e:
-                    self.log_message(f"[install error] {e}")
-                    time.sleep(1)
-    
-            self.log_message("[install] Установка завершена, финализируем данные...")
+            
+            # Очистка
+            if self.ensure_ssh_connection():
+                self.ssh_mgr.exec_command(f"rm -f {remote_log} 2>/dev/null || true")
+                self.ssh_mgr.exec_command(f"screen -S {screen_name} -X quit 2>/dev/null || true")
+            
             self.finalize_installation()
-    
-        t = threading.Thread(target=follow_log, daemon=True)
-        t.start()
+            
+        except Exception as e:
+            self.log_message(f"[finalize error] Ошибка завершения: {e}")
+            self.finalize_installation()
 
     def safe_parse_credentials(self, line):
         try:
@@ -842,66 +953,6 @@ class PageInstallXUI(BaseWizardPage):
                     
         except Exception as e:
             self.log_message(f"[parse critical error] {e}")
-
-    def read_install_log(self):
-        try:
-            if not self.ensure_ssh_connection():
-                self.log_message("[SSH] Не удалось восстановить соединение для чтения лога")
-                return
-                
-            exit_code, out, err = self.ssh_mgr.exec_command("cat /tmp/xui_install.log 2>/dev/null || echo 'NO_LOG_FILE'")
-            
-            if "NO_LOG_FILE" not in out:
-                self.log_message("[log] Читаем лог установки...")
-                lines = out.splitlines()
-                
-                for line in lines:
-                    self.safe_parse_credentials(line)
-            
-            self.check_exported_variables()
-            
-        except Exception as e:
-            self.log_message(f"[log error] Ошибка чтения лога: {e}")
-            self.check_exported_variables()
-
-    def check_exported_variables(self):
-        try:
-            if not self.ensure_ssh_connection():
-                self.log_message("[SSH] Не удалось восстановить соединение для проверки переменных")
-                return
-                
-            commands = [
-                "echo \"URL=$url\"",
-                "echo \"USERNAME=$username\"", 
-                "echo \"PASSWORD=$password\""
-            ]
-            
-            for cmd in commands:
-                try:
-                    exit_code, out, err = self.ssh_mgr.exec_command(cmd)
-                    if 'URL=' in cmd and 'url' not in self.panel_credentials:
-                        match = re.search(r'URL=([^\s]+)', out)
-                        if match and match.group(1).strip() and match.group(1) != '$url':
-                            self.panel_credentials['url'] = match.group(1).strip()
-                            self.log_message(f"[export] Найден URL: {self.panel_credentials['url']}")
-                    elif 'USERNAME=' in cmd and 'username' not in self.panel_credentials:
-                        match = re.search(r'USERNAME=([^\s]+)', out)
-                        if match and match.group(1).strip() and match.group(1) != '$username':
-                            self.panel_credentials['username'] = match.group(1).strip()
-                            self.log_message(f"[export] Найден username: {self.panel_credentials['username']}")
-                    elif 'PASSWORD=' in cmd and 'password' not in self.panel_credentials:
-                        match = re.search(r'PASSWORD=([^\s]+)', out)
-                        if match and match.group(1).strip() and match.group(1) != '$password':
-                            self.panel_credentials['password'] = match.group(1).strip()
-                            self.log_message(f"[export] Найден password: {'*' * len(self.panel_credentials['password'])}")
-                except Exception as e:
-                    self.log_message(f"[export cmd error] {cmd}: {e}")
-            
-            self.finalize_installation()
-            
-        except Exception as e:
-            self.log_message(f"[export error] {e}")
-            self.finalize_installation()
 
     def finalize_installation(self):
         self.xui_installed = True
@@ -962,19 +1013,26 @@ class PagePanelAuth(BaseWizardPage):
         super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.page_install = page_install
         self.setTitle("Шаг 3 — авторизация в 3x-ui панели")
-        self.setSubTitle("Введите данные для входа в 3x-ui панель")
+        self.setSubTitle("Введите данные для входа в 3x-ui панели")
         
         layout = QVBoxLayout()
         
+        self.url_label = QLabel("URL адрес панели:")
         self.panel_url_input = QLineEdit()
         self.panel_url_input.setPlaceholderText("URL адрес 3x-ui панели")
         
+        self.username_label = QLabel("Логин:")
         self.username_input = QLineEdit()
         self.username_input.setPlaceholderText("Логин")
         
+        self.password_label = QLabel("Пароль:")
         self.password_input = QLineEdit()
         self.password_input.setPlaceholderText("Пароль")
         self.password_input.setEchoMode(QLineEdit.Password)
+        
+        self.cancel_auto_fill_btn = QPushButton("Отменить автозаполнение")
+        self.cancel_auto_fill_btn.clicked.connect(self.cancel_auto_fill)
+        self.cancel_auto_fill_btn.setVisible(False)
         
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
@@ -990,12 +1048,13 @@ class PagePanelAuth(BaseWizardPage):
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         
-        layout.addWidget(QLabel("URL адрес панели:"))
+        layout.addWidget(self.url_label)
         layout.addWidget(self.panel_url_input)
-        layout.addWidget(QLabel("Логин:"))
+        layout.addWidget(self.username_label)
         layout.addWidget(self.username_input)
-        layout.addWidget(QLabel("Пароль:"))
+        layout.addWidget(self.password_label)
         layout.addWidget(self.password_input)
+        layout.addWidget(self.cancel_auto_fill_btn)
         layout.addWidget(self.status_label)
         layout.addWidget(self.progress_bar)
         
@@ -1003,6 +1062,31 @@ class PagePanelAuth(BaseWizardPage):
         
         self.auth_successful = False
         self.panel_info = {}
+        self.auto_fill_thread = None
+        self.stop_auto_fill = False
+
+    def cancel_auto_fill(self):
+        self.stop_auto_fill = True
+        if self.auto_fill_thread and self.auto_fill_thread.is_alive():
+            self.auto_fill_thread = None
+        self.progress_bar.setVisible(False)
+        self.cancel_auto_fill_btn.setVisible(False)
+        self._show_input_fields(True)
+        self._restore_wizard_buttons()
+        self.show_input_prompt()
+
+    def show_input_prompt(self):
+        prompt_text = (
+            "Пожалуйста, введите данные для входа в 3x-ui панель:\n\n"
+            "• URL адрес панели (например: http://ip-адрес:порт/путь)\n"
+            "• Логин администратора\n"
+            "• Пароль администратора\n\n"
+            "Эти данные обычно создаются при установке 3x-ui и могут быть найдены:\n"
+            "- В файле /root/3x-ui.txt на сервере\n"
+            "- В выводе установки 3x-ui\n"
+            "- В письме от хостинг-провайдера (для Aéza и подобных)"
+        )
+        self.status_label.setText(prompt_text)
 
     def initializePage(self):
         creds = self.page_install.get_credentials()
@@ -1014,8 +1098,243 @@ class PagePanelAuth(BaseWizardPage):
             self.password_input.setText(creds['password'])
         
         self.auth_successful = False
+        self.stop_auto_fill = False
+        QTimer.singleShot(500, self.try_auto_fill)
+
+    def try_auto_fill(self):
+        self.status_label.setText("Попытка автоматического заполнения из файла...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.cancel_auto_fill_btn.setVisible(True)
+        self._show_input_fields(False)
+        self._hide_wizard_buttons()
+        
+        if self.auto_fill_thread and self.auto_fill_thread.is_alive():
+            return
+            
+        self.auto_fill_thread = threading.Thread(target=self._auto_fill_worker, daemon=True)
+        self.auto_fill_thread.start()
+
+    def _show_input_fields(self, show):
+        self.url_label.setVisible(show)
+        self.panel_url_input.setVisible(show)
+        self.username_label.setVisible(show)
+        self.username_input.setVisible(show)
+        self.password_label.setVisible(show)
+        self.password_input.setVisible(show)
+
+    def _hide_wizard_buttons(self):
+        self.wizard().button(QWizard.NextButton).setVisible(False)
+        self.wizard().button(QWizard.BackButton).setVisible(False)
+        self.wizard().button(QWizard.CancelButton).setVisible(False)
+
+    def _restore_wizard_buttons(self):
+        self.wizard().button(QWizard.NextButton).setVisible(True)
+        self.wizard().button(QWizard.BackButton).setVisible(True)
+        self.wizard().button(QWizard.CancelButton).setVisible(True)
+
+    def _auto_fill_worker(self):
+        try:
+            credentials = self._read_credentials_file()
+            
+            if self.stop_auto_fill:
+                return
+                
+            if credentials:
+                auth_success = self._try_auto_auth(credentials)
+                if auth_success:
+                    QMetaObject.invokeMethod(self, "_on_auto_fill_success", Qt.QueuedConnection)
+                    return
+                else:
+                    QMetaObject.invokeMethod(self, "_on_auto_fill_auth_failed", Qt.QueuedConnection)
+            else:
+                QMetaObject.invokeMethod(self, "_on_auto_fill_failed", Qt.QueuedConnection)
+                
+        except Exception as e:
+            if not self.stop_auto_fill:
+                QMetaObject.invokeMethod(self, "_on_auto_fill_error", Qt.QueuedConnection, Q_ARG(str, str(e)))
+
+    def _read_credentials_file(self):
+        try:
+            if not self.ensure_ssh_connection():
+                return None
+            
+            exit_code, out, err = self.ssh_mgr.exec_command("ls /root/3x-ui.txt 2>/dev/null || echo 'NOT_FOUND'")
+            if "NOT_FOUND" in out:
+                return None
+            
+            exit_code, content, err = self.ssh_mgr.exec_command("cat /root/3x-ui.txt")
+            if not content:
+                return None
+            
+            return self.parse_credentials_from_content(content)
+                
+        except Exception as e:
+            return None
+
+    def _try_auto_auth(self, credentials):
+        try:
+            if not credentials.get('url') or not credentials.get('username') or not credentials.get('password'):
+                return False
+                
+            url = credentials['url']
+            username = credentials['username']
+            password = credentials['password']
+            
+            parsed = urlparse(url)
+            hostname = parsed.hostname or "127.0.0.1"
+            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            full_path = parsed.path.strip('/')
+            
+            clean_path = re.sub(r'(\/panel.*$)', '', f"/{full_path}").strip('/')
+            
+            use_https = parsed.scheme == 'https'
+            protocol = "https" if use_https else "http"
+            
+            cookie_jar = f"/tmp/xui_cookie_{secrets.token_hex(4)}.jar"
+            login_url = f"{protocol}://127.0.0.1:{port}"
+            if clean_path:
+                login_url += f"/{clean_path}"
+            login_url += "/login"
+            
+            login_json = json.dumps({"username": username, "password": password}).replace('"', '\\"')
+            ssl_options = "-k" if use_https else ""
+            
+            host_header = f'-H "Host: {hostname}"' if use_https else ""
+            
+            cmd = (
+                f'COOKIE_JAR={cookie_jar} && '
+                f'LOGIN_RESPONSE=$(curl -s {ssl_options} -c "$COOKIE_JAR" -X POST "{login_url}" '
+                f'{host_header} -H "Content-Type: application/json" -d "{login_json}") && '
+                f'if echo "$LOGIN_RESPONSE" | grep -q \'"success":true\'; then '
+                f'  echo "AUTH_SUCCESS"; '
+                f'else '
+                f'  echo "AUTH_FAILED"; '
+                f'fi'
+            )
+            
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=20)
+            
+            if "AUTH_SUCCESS" in out:
+                self.panel_info = {
+                    'port': port,
+                    'webpath': clean_path,
+                    'base_url': f"{protocol}://127.0.0.1:{port}" + (f"/{clean_path}" if clean_path else ""),
+                    'use_https': use_https,
+                    'cookie_jar': cookie_jar
+                }
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            return False
+
+    @Slot()
+    def _on_auto_fill_success(self):
+        self.progress_bar.setVisible(False)
+        self.cancel_auto_fill_btn.setVisible(False)
+        self._show_input_fields(True)
+        self._restore_wizard_buttons()
+        self.auth_successful = True
+        self.status_label.setText("Автоматическая авторизация успешна! Данные найдены в файле /root/3x-ui.txt")
+        self.completeChanged.emit()
+        
+        QTimer.singleShot(1000, self._go_to_next_page)
+    
+    @Slot()
+    def _go_to_next_page(self):
+        current_page = self.wizard().currentPage()
+        current_id = self.wizard().currentId()
+        
+        if self.wizard().page(current_id) == current_page:
+            self.wizard().next()
+
+
+    @Slot()
+    def _on_auto_fill_auth_failed(self):
+        self.progress_bar.setVisible(False)
+        self.cancel_auto_fill_btn.setVisible(False)
+        self._show_input_fields(True)
+        self._restore_wizard_buttons()
+        self.show_input_prompt()
+
+    @Slot()
+    def _on_auto_fill_failed(self):
+        self.progress_bar.setVisible(False)
+        self.cancel_auto_fill_btn.setVisible(False)
+        self._show_input_fields(True)
+        self._restore_wizard_buttons()
+        self.show_input_prompt()
+
+    @Slot(str)
+    def _on_auto_fill_error(self, error_msg):
+        self.progress_bar.setVisible(False)
+        self.cancel_auto_fill_btn.setVisible(False)
+        self._show_input_fields(True)
+        self._restore_wizard_buttons()
+        self.status_label.setText(f"Ошибка при автоматическом заполнении\n\nПожалуйста, введите данные для входа вручную.")
+        self.show_input_prompt()
+
+    def parse_credentials_from_content(self, content):
+        credentials = {}
+        
+        try:
+            content = content.replace('\r\n', '\n').replace('\r', '\n')
+            
+            url_patterns = [
+                r'http://[^\s<>"\'{}|\\^`\[\]]+',
+                r'https://[^\s<>"\'{}|\\^`\[\]]+',
+                r'Панель.*?доступна.*?(http[^\s]+)',
+                r'URL[:\-\s]+(http[^\s]+)',
+                r'Ссылка[:\-\s]+(http[^\s]+)',
+                r'Адрес панели[:\-\s]+(http[^\s]+)'
+            ]
+            
+            for pattern in url_patterns:
+                urls = re.findall(pattern, content, re.IGNORECASE)
+                if urls:
+                    credentials['url'] = urls[0].strip()
+                    break
+            
+            login_patterns = [
+                r'Логин[:\-\s]+([^\s\n]+)',
+                r'Login[:\-\s]+([^\s\n]+)',
+                r'Username[:\-\s]+([^\s\n]+)',
+                r'логин[:\-\s]+([^\s\n]+)'
+            ]
+            
+            for pattern in login_patterns:
+                logins = re.findall(pattern, content, re.IGNORECASE)
+                if logins:
+                    login = logins[0].strip()
+                    if not login.startswith('http') and len(login) > 1:
+                        credentials['username'] = login
+                        break
+            
+            password_patterns = [
+                r'Пароль[:\-\s]+([^\s\n]+)',
+                r'Password[:\-\s]+([^\s\n]+)',
+                r'пароль[:\-\s]+([^\s\n]+)'
+            ]
+            
+            for pattern in password_patterns:
+                passwords = re.findall(pattern, content, re.IGNORECASE)
+                if passwords:
+                    password = passwords[0].strip()
+                    if not password.startswith('http') and len(password) >= 3:
+                        credentials['password'] = password
+                        break
+            
+        except Exception as e:
+            pass
+        
+        return credentials
 
     def validatePage(self):
+        if self.auth_successful:
+            return True
+            
         url = self.panel_url_input.text().strip()
         username = self.username_input.text().strip()
         password = self.password_input.text()
@@ -1034,7 +1353,7 @@ class PagePanelAuth(BaseWizardPage):
         def _do_auth():
             try:
                 if not self.ensure_ssh_connection():
-                    error_msg[0] = "SSH соединение потеряно и не может быть восстановлено"
+                    error_msg[0] = "SSH соединение потеряно"
                     return
                     
                 parsed = urlparse(url)
@@ -1069,9 +1388,6 @@ class PagePanelAuth(BaseWizardPage):
                     f'COOKIE_JAR={cookie_jar} && '
                     f'LOGIN_RESPONSE=$(curl -s {ssl_options} -c "$COOKIE_JAR" -X POST "{login_url}" '
                     f'{host_header} -H "Content-Type: application/json" -d "{login_json}") && '
-                    f'echo "=== LOGIN RESPONSE ===" && '
-                    f'echo "$LOGIN_RESPONSE" && '
-                    f'echo "=== END LOGIN RESPONSE ===" && '
                     f'if echo "$LOGIN_RESPONSE" | grep -q \'"success":true\'; then '
                     f'  echo "AUTH_SUCCESS"; '
                     f'else '
@@ -1079,32 +1395,18 @@ class PagePanelAuth(BaseWizardPage):
                     f'fi'
                 )
                 
-                self.log_message(f"[auth] Выполняем авторизацию:")
-                self.log_message(f"[auth] URL: {login_url}")
-                self.log_message(f"[auth] Используем HTTPS: {use_https}")
-                self.log_message(f"[auth] Хост из ссылки: {hostname}")
-                self.log_message(f"[auth] Команда: curl -s {ssl_options} -c cookie_jar -X POST {login_url} "
-                                 f"{host_header} -H 'Content-Type: application/json' -d '{{\"username\": \"{username}\", \"password\": \"***\"}}'")
-                
                 exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=30)
                 
-                self.log_message(f"[auth] Статус выполнения: {exit_code}")
                 if "AUTH_SUCCESS" in out:
                     success[0] = True
                     self.panel_info['cookie_jar'] = cookie_jar
-                    self.log_message("[auth] Авторизация прошла успешно")
                 else:
                     success[0] = False
-                    error_msg[0] = "Неверные учетные данные или недоступна панель"
-                    self.log_message("[auth] Ошибка авторизации")
-                    self.log_message(f"[auth] Вывод: {out}")
-                    if err:
-                        self.log_message(f"[auth] Ошибка: {err}")
+                    error_msg[0] = "Неверные учетные данные"
                 
             except Exception as e:
                 success[0] = False
                 error_msg[0] = str(e)
-                self.log_message(f"[auth error] {e}")
         
         t = threading.Thread(target=_do_auth, daemon=True)
         t.start()
@@ -1127,7 +1429,7 @@ class PagePanelAuth(BaseWizardPage):
         return self.panel_info
 
     def isComplete(self):
-        return True
+        return self.auth_successful
     
     def nextId(self):
         return 3
