@@ -2375,6 +2375,10 @@ class PageInbound(BaseWizardPage):
             'speed_ok': False
         }
 
+        self.priority_sni_list = ["web.max.ru", "download.max.ru", "botapi.max.ru"]
+        self.priority_sni_index = 0  # Индекс текущего приоритетного SNI
+        self.priority_sni_used = False  # Флаг, что приоритетные SNI использованы
+
         self.setup_shortcuts()
 
     def refresh_sni_list(self):
@@ -2428,7 +2432,31 @@ class PageInbound(BaseWizardPage):
         self.add_test_log(f"Ошибка обновления SNI: {error_message}")
         QMessageBox.warning(self, "Ошибка", 
                            f"Не удалось обновить список SNI:\n{error_message}")
-    
+
+    def get_next_sni(self):
+        if self.priority_sni_index < len(self.priority_sni_list):
+            sni = self.priority_sni_list[self.priority_sni_index]
+            self.priority_sni_index += 1
+            self._emit_test_log(f"Используем приоритетный SNI: {sni} ({self.priority_sni_index}/{len(self.priority_sni_list)})")
+            
+            self.sni_manager.mark_sni_used(sni)
+            self.update_sni_info()
+            
+            return sni
+        
+        self.priority_sni_used = True
+        sni = self.sni_manager.get_next_sni()
+        if sni:
+            self.current_sni = sni
+            self.sni_manager.mark_sni_used(sni)
+            self.update_sni_info()
+            self.log_message(f"Используем SNI из общего списка: {sni}")
+        return sni
+
+    def reset_sni_priority(self):
+        self.priority_sni_index = 0
+        self.priority_sni_used = False
+
     #def update_auto_test_status(self, status, color):
     #    status_texts = {
     #        "waiting": "ОЖИДАНИЕ",
@@ -2471,6 +2499,8 @@ class PageInbound(BaseWizardPage):
         self.status_label.setText("Генерация нового Vless ключа...")
         self.clear_test_log()
         self.add_test_log("Генерируем новый Vless ключ...")
+        
+        self.reset_sni_priority()
         
         threading.Thread(target=self._regenerate_vless_worker, daemon=True).start()
 
@@ -2579,7 +2609,10 @@ class PageInbound(BaseWizardPage):
         #self.update_auto_test_status("testing", "#ffc107")  # Желтый - подбор
         self.clear_test_log()
         self.add_test_log("Запуск автоматического подбора SNI...")
-        self.add_test_log("Ищем рабочий SNI")
+        self.add_test_log("Сначала тестируем приоритетные SNI: web.max.ru, download.max.ru, botapi.max.ru")
+        self.add_test_log("Затем переходим к остальным SNI из списка")
+        
+        self.reset_sni_priority()
         
         threading.Thread(target=self._run_auto_configuration, daemon=True).start()
 
@@ -2599,7 +2632,8 @@ class PageInbound(BaseWizardPage):
                 self._emit_test_log("Нет доступных SNI для тестирования")
                 break
                 
-            self._emit_test_log(f"Тестируем SNI: {sni}")
+            sni_type = "приоритетный" if not self.priority_sni_used else "обычный"
+            self._emit_test_log(f"Тестируем {sni_type} SNI: {sni}")
             
             config_updated = self._update_configuration_with_sni(sni)
             if not config_updated:
@@ -2616,7 +2650,8 @@ class PageInbound(BaseWizardPage):
             if speed_ok:
                 download_speed = self.current_stats.get('download', 0)
                 upload_speed = self.current_stats.get('upload', 0)
-                self._emit_test_log(f"Найден рабочий SNI: {sni}")
+                sni_type = "приоритетный" if sni in self.priority_sni_list else "обычный"
+                self._emit_test_log(f"Найден рабочий {sni_type} SNI: {sni}")
                 
                 self._emit_auto_config_success(sni)
                 break
@@ -3005,6 +3040,8 @@ class PageInbound(BaseWizardPage):
         self.panel_info = self.page_auth.get_panel_info()
         self.cookie_jar = self.panel_info.get('cookie_jar', '')
         
+        self.reset_sni_priority()
+        
         #self.update_auto_test_status("waiting", "#6c757d")  # Серый - ожидание
         
         if self.ssh_mgr.client:
@@ -3019,15 +3056,6 @@ class PageInbound(BaseWizardPage):
         used_count = self.sni_manager.get_used_count()
         available_count = self.sni_manager.get_available_count()
         self.sni_info_label.setText(f"Использовано SNI: {used_count}, Доступно: {available_count}")
-
-    def get_next_sni(self):
-        sni = self.sni_manager.get_next_sni()
-        if sni:
-            self.current_sni = sni
-            self.sni_manager.mark_sni_used(sni)
-            self.update_sni_info()
-            self.log_message(f"Используем SNI: {sni}")
-        return sni
 
     def start_configuration(self):
         self.status_label.setText("Начинаем настройку подключения...")
@@ -3163,7 +3191,7 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-CURRENT_VERSION = "1.1.3"
+CURRENT_VERSION = "1.1.5"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
