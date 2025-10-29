@@ -857,7 +857,6 @@ class PageInstallXUI(BaseWizardPage):
             self.safe_update_status("Подготовка к установке 3x-ui...")
             self.log_message("[install] Начинаем установку 3x-ui...")
         
-            # Проверяем соединение перед началом
             if not self.ensure_ssh_connection():
                 self.log_message("[install] Ошибка: нет SSH соединения")
                 self.safe_update_status("Ошибка: нет SSH соединения")
@@ -874,30 +873,25 @@ class PageInstallXUI(BaseWizardPage):
             remote_script = f"/tmp/3xinstall_{secrets.token_hex(4)}.sh"
             remote_log = f"/tmp/xui_install_{secrets.token_hex(4)}.log"
         
-            # Загружаем файл с повторными попытками
             if not self.upload_with_retry(str(script_path), remote_script):
                 self.log_message("[install] Ошибка загрузки скрипта установки")
                 self.safe_update_status("Ошибка загрузки скрипта")
                 self.safe_hide_progress()
                 return
         
-            # Даем права на выполнение
             self.ssh_mgr.exec_command(f"chmod +x {remote_script}")
         
-            # Проверяем наличие screen и устанавливаем если нужно
             exit_code, out, err = self.ssh_mgr.exec_command("command -v screen || echo 'NO_SCREEN'")
             if "NO_SCREEN" in out:
                 self.log_message("[install] Устанавливаем screen...")
                 self.ssh_mgr.exec_command("apt-get update && apt-get install -y screen || yum install -y screen || dnf install -y screen")
         
-            # Запускаем установку в screen
             screen_name = f"xui_{secrets.token_hex(3)}"
             self.log_message(f"[install] Запускаем установку в screen сессии {screen_name}...")
             
             cmd = f"screen -dmS {screen_name} bash -c 'bash {remote_script} > {remote_log} 2>&1; echo __XUI_DONE__ >> {remote_log}'"
             self.ssh_mgr.exec_command(cmd)
         
-            # Мониторим лог установки
             self.follow_install_log(remote_log, screen_name)
             
         except Exception as e:
@@ -906,7 +900,6 @@ class PageInstallXUI(BaseWizardPage):
             self.safe_hide_progress()
 
     def upload_with_retry(self, local_path, remote_path, max_retries=3):
-        """Загрузка файла с повторными попытками при разрыве соединения"""
         for attempt in range(max_retries):
             try:
                 if not self.ensure_ssh_connection():
@@ -945,14 +938,12 @@ class PageInstallXUI(BaseWizardPage):
                     time.sleep(3)
                     continue
                 
-                # Проверяем статус screen сессии
                 exit_code, out, err = self.ssh_mgr.exec_command(f"screen -list | grep {screen_name} || echo 'NOT_FOUND'")
                 
                 if "NOT_FOUND" in out:
                     self.log_message("[log] Screen сессия завершена, проверяем результат...")
                     break
                 
-                # Читаем лог
                 exit_code, out, err = self.ssh_mgr.exec_command(f"tail -c +{last_size + 1} {remote_log} 2>/dev/null || echo ''")
                 
                 if out:
@@ -967,7 +958,6 @@ class PageInstallXUI(BaseWizardPage):
                                 self.log_message("[log] Обнаружен маркер завершения установки")
                                 break
                     
-                    # Обновляем размер для следующего чтения
                     exit_code, size_out, err = self.ssh_mgr.exec_command(f"stat -c%s {remote_log} 2>/dev/null || wc -c < {remote_log} 2>/dev/null || echo '0'")
                     if size_out.strip().isdigit():
                         last_size = int(size_out.strip())
@@ -984,7 +974,6 @@ class PageInstallXUI(BaseWizardPage):
             self.log_message("[log] Превышено максимальное количество ошибок, завершаем мониторинг")
             self.safe_update_status("Ошибка: слишком много разрывов соединения")
         
-        # Финальная проверка и завершение
         self.finalize_installation_check(remote_log, screen_name)
 
     def finalize_installation_check(self, remote_log, screen_name):
@@ -2348,7 +2337,9 @@ class PageInbound(BaseWizardPage):
         layout.addLayout(self.test_actions_layout)
         
         btn_layout_bottom = QHBoxLayout()
-        self.regenerate_btn = QPushButton("Не работает VPN - сгенерировать Vless ключ")
+        self.regenerate_btn_original_text = "Не работает VPN - сгенерировать Vless ключ"
+        self.regenerate_btn_retry_text = "Всё равно не работает - попробовать другой SNI"
+        self.regenerate_btn = QPushButton(self.regenerate_btn_original_text)
         self.regenerate_btn.clicked.connect(self.regenerate_vless)
         btn_layout_bottom.addWidget(self.regenerate_btn)
         layout.addLayout(btn_layout_bottom)
@@ -2376,8 +2367,10 @@ class PageInbound(BaseWizardPage):
         }
 
         self.priority_sni_list = ["web.max.ru", "download.max.ru", "botapi.max.ru"]
-        self.priority_sni_index = 0  # Индекс текущего приоритетного SNI
-        self.priority_sni_used = False  # Флаг, что приоритетные SNI использованы
+        self.priority_sni_index = 0
+        self.priority_sni_used = False
+        self.regenerate_attempt_count = 0
+        self.last_used_sni_index = -1
 
         self.setup_shortcuts()
 
@@ -2453,27 +2446,37 @@ class PageInbound(BaseWizardPage):
             self.log_message(f"Используем SNI из общего списка: {sni}")
         return sni
 
+    def get_next_regenerate_sni(self):
+        self.regenerate_attempt_count += 1
+        
+        if self.regenerate_attempt_count == 1:
+            self.priority_sni_index = 0
+            self.priority_sni_used = False
+        
+        if self.priority_sni_index < len(self.priority_sni_list):
+            sni = self.priority_sni_list[self.priority_sni_index]
+            self.priority_sni_index += 1
+            self._emit_test_log(f"Используем приоритетный SNI: {sni} ({self.priority_sni_index}/{len(self.priority_sni_list)})")
+            
+            self.sni_manager.mark_sni_used(sni)
+            self.update_sni_info()
+            
+            return sni
+        
+        self.priority_sni_used = True
+        sni = self.sni_manager.get_next_sni()
+        if sni:
+            self.current_sni = sni
+            self.sni_manager.mark_sni_used(sni)
+            self.update_sni_info()
+            self.log_message(f"Используем SNI из общего списка: {sni}")
+        return sni
+
     def reset_sni_priority(self):
         self.priority_sni_index = 0
         self.priority_sni_used = False
-
-    #def update_auto_test_status(self, status, color):
-    #    status_texts = {
-    #        "waiting": "ОЖИДАНИЕ",
-    #        "testing": "Идёт автоматический подбор настроек, пожалуйста ожидайте.",
-    #        "success": "УСПЕХ"
-    #    }
-    #    
-    #    self.auto_test_status.setText(status_texts[status])
-    #    self.auto_test_status.setStyleSheet(f"""
-    #        QLabel {{
-    #            padding: 4px 8px;
-    #            border-radius: 4px;
-    #            background-color: {color};
-    #            color: white;
-    #            font-weight: bold;
-    #        }}
-    #    """)
+        self.regenerate_attempt_count = 0
+        self.regenerate_btn.setText(self.regenerate_btn_original_text)
 
     def setup_shortcuts(self):
         shortcut = QShortcut(QKeySequence("Ctrl+L"), self)
@@ -2495,12 +2498,17 @@ class PageInbound(BaseWizardPage):
         if not self.panel_info:
             QMessageBox.warning(self, "Ошибка", "Нет данных панели для генерации ключа")
             return
-            
+        
+        if self.regenerate_attempt_count == 0:
+            self.regenerate_btn.setText(self.regenerate_btn_retry_text)
+        
         self.status_label.setText("Генерация нового Vless ключа...")
         self.clear_test_log()
-        self.add_test_log("Генерируем новый Vless ключ...")
         
-        self.reset_sni_priority()
+        if self.regenerate_attempt_count == 0:
+            self.add_test_log("Генерируем новый Vless ключ...")
+        else:
+            self.add_test_log(f"Попытка #{self.regenerate_attempt_count + 1} - пробуем другой SNI...")
         
         threading.Thread(target=self._regenerate_vless_worker, daemon=True).start()
 
@@ -2515,9 +2523,10 @@ class PageInbound(BaseWizardPage):
                 self._emit_test_log("Не удалось получить ключи")
                 return
                 
-            sni = self.get_next_sni()
+            sni = self.get_next_regenerate_sni()
             if not sni:
                 self._emit_test_log("Нет доступных SNI")
+                self.reset_sni_priority()
                 return
                 
             if self.current_inbound_id:
@@ -2939,6 +2948,9 @@ class PageInbound(BaseWizardPage):
             
             if result.get('success'):
                 self._emit_test_log("Inbound обновлен успешно")
+                if self.existing_clients:
+                    client_count = len(self.existing_clients)
+                    self._emit_test_log(f"Обновлено {client_count} клиентов с flow=xtls-rprx-vision")
                 self._generate_and_show_vless(client_id, sni, pub_key, short_id)
                 return True
             else:
@@ -3096,6 +3108,11 @@ class PageInbound(BaseWizardPage):
                         self.log_message(f"Найден inbound-443 с ID: {self.current_inbound_id}")
                         self.existing_clients = self.get_existing_clients(inbound)
                         self.log_message(f"Найдено клиентов: {len(self.existing_clients)}")
+                        
+                        for i, client in enumerate(self.existing_clients):
+                            current_flow = client.get('flow', 'не установлен')
+                            self.log_message(f"Клиент {i+1}: flow={current_flow}")
+                        
                         break
                 
                 if inbound_found:
@@ -3119,7 +3136,15 @@ class PageInbound(BaseWizardPage):
             settings_str = inbound.get('settings', '{}')
             settings = json.loads(settings_str)
             clients = settings.get('clients', [])
-            return clients
+            
+            updated_clients = []
+            for client in clients:
+                updated_client = client.copy()
+                updated_client['flow'] = "xtls-rprx-vision"
+                updated_clients.append(updated_client)
+            
+            return updated_clients
+            
         except Exception as e:
             self.log_message(f"Ошибка парсинга клиентов: {e}")
             return []
@@ -3191,7 +3216,11 @@ class PageInbound(BaseWizardPage):
     def isComplete(self):
         return True
 
-CURRENT_VERSION = "1.1.5"
+    def cleanupPage(self):
+        self.reset_sni_priority()
+        super().cleanupPage()
+
+CURRENT_VERSION = "1.1.6"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 

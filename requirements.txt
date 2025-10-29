@@ -6,3 +6,4 @@ pysocks
 qrcode
 speedtest-cli
 pillow
+socks
