@@ -35,22 +35,78 @@ if command -v x-ui &> /dev/null; then
     rm -rf /usr/local/x-ui /etc/x-ui /usr/bin/x-ui /etc/systemd/system/x-ui.service
     systemctl daemon-reexec
     systemctl daemon-reload
-    rm -f "$OUTPUT_FILE"
+    rm /root/3x-ui.txt
     echo "x-ui успешно удалена. Продолжаем выполнение скрипта..."
 fi
 
-echo "Установка 3x-ui..."
-cd /usr/local/ || exit 1
-ARCH=$(uname -m)
+PORT=8080
 
-case "$ARCH" in
-    x86_64) ARCH_DL="amd64" ;;
-    aarch64) ARCH_DL="arm64" ;;
-    armv7l) ARCH_DL="armv7" ;;
-    *) echo "Неизвестная архитектура: $ARCH"; exit 1 ;;
+gen_random_string() {
+    local length="$1"
+    LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "$length" | head -n 1
+}
+USERNAME=$(gen_random_string 10)
+PASSWORD=$(gen_random_string 10)
+WEBPATH=$(gen_random_string 18)
+
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${red}Ошибка:${plain} скрипт нужно запускать от root"
+    exit 1
+fi
+
+if [[ -f /etc/os-release ]]; then
+    source /etc/os-release
+    release=$ID
+else
+    echo "Не удалось определить ОС"
+    exit 1
+fi
+
+arch() {
+    case "$(uname -m)" in
+        x86_64 | x64 | amd64) echo 'amd64' ;;
+        i*86 | x86) echo '386' ;;
+        armv8* | arm64 | aarch64) echo 'arm64' ;;
+        armv7* | arm) echo 'armv7' ;;
+        armv6*) echo 'armv6' ;;
+        armv5*) echo 'armv5' ;;
+        s390x) echo 's390x' ;;
+        *) echo "unknown" ;;
+    esac
+}
+ARCH=$(arch)
+
+case "${release}" in
+    ubuntu | debian | armbian)
+        apt-get update > /dev/null
+        apt-get install -y -q wget curl tar tzdata jq xxd > /dev/null
+        ;;
+    centos | rhel | almalinux | rocky | ol)
+        yum -y update > /dev/null
+        yum install -y -q wget curl tar tzdata jq xxd > /dev/null
+        ;;
+    fedora | amzn | virtuozzo)
+        dnf -y update > /dev/null
+        dnf install -y -q wget curl tar tzdata jq xxd > /dev/null
+        ;;
+    arch | manjaro | parch)
+        pacman -Syu --noconfirm > /dev/null
+        pacman -S --noconfirm wget curl tar tzdata jq xxd > /dev/null
+        ;;
+    opensuse-tumbleweed)
+        zypper refresh > /dev/null
+        zypper install -y wget curl tar timezone jq xxd > /dev/null
+        ;;
+    *)
+        apt-get update > /dev/null
+        apt-get install -y wget curl tar tzdata jq xxd > /dev/null
+        ;;
 esac
 
-wget -q -O x-ui-linux-${ARCH}.tar.gz "https://github.com/MHSanaei/3x-ui/releases/download/v2.6.7/x-ui-linux-${ARCH_DL}.tar.gz"
+# Установка x-ui
+cd /usr/local/ || exit 1
+#tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+wget -q -O x-ui-linux-${ARCH}.tar.gz https://github.com/MHSanaei/3x-ui/releases/download/v2.6.7/x-ui-linux-amd64.tar.gz
 
 systemctl stop x-ui 2>/dev/null
 rm -rf /usr/local/x-ui/
@@ -64,24 +120,31 @@ chmod +x x-ui bin/xray-linux-${ARCH}
 cp -f x-ui.service /etc/systemd/system/
 wget -q -O /usr/bin/x-ui https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
 chmod +x /usr/local/x-ui/x-ui.sh /usr/bin/x-ui
-echo "3x-ui установлена успешно!"
 
-echo "Изменение логина и пароля..."
-PASSWORD=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
-WEBPATH=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
-/usr/local/x-ui/x-ui setting -username "admin" -password "${PASSWORD}" -webBasePath "${WEBPATH}" -port "8080"
+/usr/local/x-ui/x-ui setting -username "$USERNAME" -password "$PASSWORD" -port "$PORT" -webBasePath "$WEBPATH"
+/usr/local/x-ui/x-ui migrate
 
-SERVER_IP=$(hostname -I | awk '{print $1}')
+systemctl daemon-reload
+systemctl enable x-ui
+systemctl start x-ui
 
-systemctl restart x-ui
-x-ui enable
+SERVER_IP=${SERVER_IP:-$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://4.ident.me)}
+
+echo -e "\n\033[1;32mПанель управления 3X-UI доступна по следующим данным:"
+echo -e "Адрес панели: http://${SERVER_IP}:${PORT}/${WEBPATH}"
+echo -e "Логин:        ${USERNAME}"
+echo -e "Пароль:       ${PASSWORD}"
 
 {
-    echo -e "\nПанель 3x-ui доступна по ссылке: http://$SERVER_IP:8080/$WEBPATH"
-    echo -e "Логин: admin"
-    echo -e "Пароль: $PASSWORD"
-} | tee "$OUTPUT_FILE"
+  echo "Панель управления 3X-UI доступна по следующим данным:"
+  echo "Адрес панели - http://${SERVER_IP}:${PORT}/${WEBPATH}"
+  echo "Логин:         ${USERNAME}"
+  echo "Пароль:        ${PASSWORD}"
+  echo ""
+  echo "Инструкции по настройке VPN приложений:"
+  echo "https://wiki.yukikras.net/ru/nastroikavpn"
+} >> /root/3x-ui.txt
 
 export url="http://$SERVER_IP:8080/$WEBPATH"
-export username="admin"
+export username="${USERNAME}"
 export password="${PASSWORD}"

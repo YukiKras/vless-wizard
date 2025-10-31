@@ -814,7 +814,6 @@ class PageInstallXUI(BaseWizardPage):
         t.start()
 
     def start_xui_installation(self):
-        """Запуск установки 3x-ui (используется при обычной установке и принудительной переустановке)"""
         self.log_message("[install] Начинаем установку 3x-ui...")
         self.safe_update_status("Запуск установки 3x-ui...")
         self.progress_bar.setVisible(True)
@@ -852,9 +851,8 @@ class PageInstallXUI(BaseWizardPage):
         self.start_xui_installation()
 
     def install_xui(self):
-        """Основной метод установки с улучшенной обработкой ошибок"""
         try:
-            self.safe_update_status("Подготовка к установке 3x-ui...")
+            self.safe_update_status("Установка 3x-ui панели...")
             self.log_message("[install] Начинаем установку 3x-ui...")
         
             if not self.ensure_ssh_connection():
@@ -922,7 +920,6 @@ class PageInstallXUI(BaseWizardPage):
         return False
 
     def follow_install_log(self, remote_log, screen_name):
-        """Мониторинг лога установки с обработкой разрывов соединения"""
         seen_lines = set()
         last_size = 0
         consecutive_errors = 0
@@ -977,7 +974,6 @@ class PageInstallXUI(BaseWizardPage):
         self.finalize_installation_check(remote_log, screen_name)
 
     def finalize_installation_check(self, remote_log, screen_name):
-        """Финальная проверка результатов установки"""
         try:
             self.log_message("[finalize] Завершаем установку...")
             
@@ -1111,9 +1107,22 @@ class PagePanelAuth(BaseWizardPage):
         super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
         self.page_install = page_install
         self.setTitle("Шаг 3 — авторизация в 3x-ui панели")
-        self.setSubTitle("Введите данные для входа в 3x-ui панели")
+        self.setSubTitle("Попытка автоматической авторизации...")
         
         layout = QVBoxLayout()
+        
+        self.auto_fill_status = QLabel()
+        self.auto_fill_status.setWordWrap(True)
+        self.auto_fill_status.setAlignment(Qt.AlignCenter)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        
+        self.cancel_auto_fill_btn = QPushButton("Отменить автозаполнение")
+        self.cancel_auto_fill_btn.clicked.connect(self.cancel_auto_fill)
+        
+        self.input_container = QWidget()
+        input_layout = QVBoxLayout(self.input_container)
         
         self.url_label = QLabel("URL адрес панели:")
         self.panel_url_input = QLineEdit()
@@ -1128,10 +1137,6 @@ class PagePanelAuth(BaseWizardPage):
         self.password_input.setPlaceholderText("Пароль")
         self.password_input.setEchoMode(QLineEdit.Password)
         
-        self.cancel_auto_fill_btn = QPushButton("Отменить автозаполнение")
-        self.cancel_auto_fill_btn.clicked.connect(self.cancel_auto_fill)
-        self.cancel_auto_fill_btn.setVisible(False)
-        
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
         self.status_label.setText(
@@ -1143,18 +1148,20 @@ class PagePanelAuth(BaseWizardPage):
         )
         self.status_label.setOpenExternalLinks(True)
 
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
+        input_layout.addWidget(self.url_label)
+        input_layout.addWidget(self.panel_url_input)
+        input_layout.addWidget(self.username_label)
+        input_layout.addWidget(self.username_input)
+        input_layout.addWidget(self.password_label)
+        input_layout.addWidget(self.password_input)
+        input_layout.addWidget(self.status_label)
         
-        layout.addWidget(self.url_label)
-        layout.addWidget(self.panel_url_input)
-        layout.addWidget(self.username_label)
-        layout.addWidget(self.username_input)
-        layout.addWidget(self.password_label)
-        layout.addWidget(self.password_input)
-        layout.addWidget(self.cancel_auto_fill_btn)
-        layout.addWidget(self.status_label)
+        self.input_container.setVisible(False)
+        
+        layout.addWidget(self.auto_fill_status)
         layout.addWidget(self.progress_bar)
+        layout.addWidget(self.cancel_auto_fill_btn)
+        layout.addWidget(self.input_container)
         
         self.setLayout(layout)
         
@@ -1162,17 +1169,39 @@ class PagePanelAuth(BaseWizardPage):
         self.panel_info = {}
         self.auto_fill_thread = None
         self.stop_auto_fill = False
+        self.auto_fill_completed = False
 
     def cancel_auto_fill(self):
         self.stop_auto_fill = True
         if self.auto_fill_thread and self.auto_fill_thread.is_alive():
             self.auto_fill_thread = None
-        self.progress_bar.setVisible(False)
-        self.cancel_auto_fill_btn.setVisible(False)
-        self._show_input_fields(True)
-        self._restore_wizard_buttons()
+        self._show_input_form()
 
     def initializePage(self):
+        self.auth_successful = False
+        self.auto_fill_completed = False
+        self.stop_auto_fill = False
+        
+        self._show_auto_fill_form()
+        
+        QTimer.singleShot(500, self.try_auto_fill)
+
+    def _show_auto_fill_form(self):
+        self.setSubTitle("Попытка автоматической авторизации...")
+        self.auto_fill_status.setText("Ищем сохраненные данные для входа в файле /root/3x-ui.txt...")
+        self.progress_bar.setVisible(True)
+        self.cancel_auto_fill_btn.setVisible(True)
+        self.input_container.setVisible(False)
+        self._hide_wizard_buttons()
+
+    def _show_input_form(self):
+        self.setSubTitle("Введите данные для входа в 3x-ui панели")
+        self.auto_fill_status.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.cancel_auto_fill_btn.setVisible(False)
+        self.input_container.setVisible(True)
+        self._restore_wizard_buttons()
+        
         creds = self.page_install.get_credentials()
         if 'url' in creds:
             self.panel_url_input.setText(creds['url'])
@@ -1180,32 +1209,6 @@ class PagePanelAuth(BaseWizardPage):
             self.username_input.setText(creds['username'])
         if 'password' in creds:
             self.password_input.setText(creds['password'])
-        
-        self.auth_successful = False
-        self.stop_auto_fill = False
-        QTimer.singleShot(500, self.try_auto_fill)
-
-    def try_auto_fill(self):
-        self.status_label.setText("Попытка автоматического заполнения из файла...")
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.cancel_auto_fill_btn.setVisible(True)
-        self._show_input_fields(False)
-        self._hide_wizard_buttons()
-        
-        if self.auto_fill_thread and self.auto_fill_thread.is_alive():
-            return
-            
-        self.auto_fill_thread = threading.Thread(target=self._auto_fill_worker, daemon=True)
-        self.auto_fill_thread.start()
-
-    def _show_input_fields(self, show):
-        self.url_label.setVisible(show)
-        self.panel_url_input.setVisible(show)
-        self.username_label.setVisible(show)
-        self.username_input.setVisible(show)
-        self.password_label.setVisible(show)
-        self.password_input.setVisible(show)
 
     def _hide_wizard_buttons(self):
         self.wizard().button(QWizard.NextButton).setVisible(False)
@@ -1217,26 +1220,52 @@ class PagePanelAuth(BaseWizardPage):
         self.wizard().button(QWizard.BackButton).setVisible(True)
         self.wizard().button(QWizard.CancelButton).setVisible(True)
 
+    def try_auto_fill(self):
+        if self.auto_fill_thread and self.auto_fill_thread.is_alive():
+            return
+            
+        self.auto_fill_thread = threading.Thread(target=self._auto_fill_worker, daemon=True)
+        self.auto_fill_thread.start()
+
     def _auto_fill_worker(self):
         try:
+            if self.stop_auto_fill:
+                return
+                
+            QMetaObject.invokeMethod(self, "_update_auto_fill_status", 
+                                   Qt.QueuedConnection, 
+                                   Q_ARG(str, "Поиск файла с данными для входа..."))
+            
             credentials = self._read_credentials_file()
             
             if self.stop_auto_fill:
                 return
                 
-            if credentials:
-                auth_success = self._try_auto_auth(credentials)
-                if auth_success:
-                    QMetaObject.invokeMethod(self, "_on_auto_fill_success", Qt.QueuedConnection)
-                    return
-                else:
-                    QMetaObject.invokeMethod(self, "_on_auto_fill_auth_failed", Qt.QueuedConnection)
-            else:
+            if not credentials:
                 QMetaObject.invokeMethod(self, "_on_auto_fill_failed", Qt.QueuedConnection)
+                return
+                
+            QMetaObject.invokeMethod(self, "_update_auto_fill_status", 
+                                   Qt.QueuedConnection, 
+                                   Q_ARG(str, "Проверка авторизации с найденными данными..."))
+            
+            auth_success = self._try_auto_auth(credentials)
+            
+            if self.stop_auto_fill:
+                return
+                
+            if auth_success:
+                QMetaObject.invokeMethod(self, "_on_auto_fill_success", Qt.QueuedConnection)
+            else:
+                QMetaObject.invokeMethod(self, "_on_auto_fill_auth_failed", Qt.QueuedConnection)
                 
         except Exception as e:
             if not self.stop_auto_fill:
                 QMetaObject.invokeMethod(self, "_on_auto_fill_error", Qt.QueuedConnection, Q_ARG(str, str(e)))
+
+    @Slot(str)
+    def _update_auto_fill_status(self, message):
+        self.auto_fill_status.setText(message)
 
     def _read_credentials_file(self):
         try:
@@ -1316,16 +1345,34 @@ class PagePanelAuth(BaseWizardPage):
 
     @Slot()
     def _on_auto_fill_success(self):
+        self.auto_fill_completed = True
+        self.auth_successful = True
+        self.auto_fill_status.setText("Автоматическая авторизация успешно прошла!")
         self.progress_bar.setVisible(False)
         self.cancel_auto_fill_btn.setVisible(False)
-        self._show_input_fields(True)
         self._restore_wizard_buttons()
-        self.auth_successful = True
-        self.status_label.setText("Автоматическая авторизация успешна! Данные найдены в файле /root/3x-ui.txt")
         self.completeChanged.emit()
         
-        QTimer.singleShot(1000, self._go_to_next_page)
-    
+        QTimer.singleShot(2000, self._go_to_next_page)
+
+    @Slot()
+    def _on_auto_fill_auth_failed(self):
+        self.auto_fill_completed = True
+        self.auto_fill_status.setText("Найдены данные для входа, но авторизация не удалась")
+        QTimer.singleShot(1000, self._show_input_form)
+
+    @Slot()
+    def _on_auto_fill_failed(self):
+        self.auto_fill_completed = True
+        self.auto_fill_status.setText("Файл с данными для входа не найден")
+        QTimer.singleShot(1000, self._show_input_form)
+
+    @Slot(str)
+    def _on_auto_fill_error(self, error_msg):
+        self.auto_fill_completed = True
+        self.auto_fill_status.setText(f"Ошибка при автоматическом заполнении")
+        QTimer.singleShot(1000, self._show_input_form)
+
     @Slot()
     def _go_to_next_page(self):
         current_page = self.wizard().currentPage()
@@ -1333,28 +1380,6 @@ class PagePanelAuth(BaseWizardPage):
         
         if self.wizard().page(current_id) == current_page:
             self.wizard().next()
-
-    @Slot()
-    def _on_auto_fill_auth_failed(self):
-        self.progress_bar.setVisible(False)
-        self.cancel_auto_fill_btn.setVisible(False)
-        self._show_input_fields(True)
-        self._restore_wizard_buttons()
-
-    @Slot()
-    def _on_auto_fill_failed(self):
-        self.progress_bar.setVisible(False)
-        self.cancel_auto_fill_btn.setVisible(False)
-        self._show_input_fields(True)
-        self._restore_wizard_buttons()
-
-    @Slot(str)
-    def _on_auto_fill_error(self, error_msg):
-        self.progress_bar.setVisible(False)
-        self.cancel_auto_fill_btn.setVisible(False)
-        self._show_input_fields(True)
-        self._restore_wizard_buttons()
-        self.status_label.setText(f"Ошибка при автоматическом заполнении\n\nПожалуйста, введите данные для входа вручную.")
 
     def parse_credentials_from_content(self, content):
         credentials = {}
@@ -3220,7 +3245,7 @@ class PageInbound(BaseWizardPage):
         self.reset_sni_priority()
         super().cleanupPage()
 
-CURRENT_VERSION = "1.1.6"
+CURRENT_VERSION = "1.1.7"
 GITHUB_USER = "yukikras"
 GITHUB_REPO = "vless-wizard"
 
@@ -3253,7 +3278,7 @@ def check_for_update(parent=None):
 class XUIWizard(QWizard):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Vless Wizard")
+        self.setWindowTitle(f"Vless Wizard v{CURRENT_VERSION}")
         self.resize(500, 500)
         
         self.log_window = LogWindow()
@@ -3287,7 +3312,6 @@ class XUIWizard(QWizard):
         self.logger_sig.new_line.connect(self.log_window.append_main_log)
 
     def hide_back_button(self):
-        """Скрывает кнопку назад"""
         back_button = self.button(QWizard.BackButton)
         if back_button:
             back_button.hide()
