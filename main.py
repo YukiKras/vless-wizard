@@ -2578,15 +2578,21 @@ class AutoTestWorker(QObject):
         }
 
         try:
+            self.log_message.emit(f"  ├─ Создаю тестовый воркер...")
             # Создаем test worker
             self.test_worker = TestWorker(vless_config, "speed")
 
             # Запускаем в отдельном потоке
             test_finished = [False]
             test_stats = [{}]
+            log_count = [0]
 
             def on_log(msg):
-                self.log_message.emit(f"  └─ {msg}")
+                log_count[0] += 1
+                if log_count[0] <= 5:  # Показываем только первые 5 логов
+                    self.log_message.emit(f"  │  └─ {msg}")
+                elif log_count[0] == 6:
+                    self.log_message.emit(f"  │  └─ ... (логи скрыты)")
 
             def on_completed(stats):
                 test_stats[0] = stats
@@ -2595,20 +2601,54 @@ class AutoTestWorker(QObject):
             self.test_worker.log_message.connect(on_log)
             self.test_worker.test_completed.connect(on_completed)
 
+            self.log_message.emit(f"  ├─ Запускаю Xray и жду инициализации...")
             # Запускаем тест в отдельном потоке
             test_thread = threading.Thread(target=self.test_worker.run_test, daemon=True)
             test_thread.start()
 
-            # Ждем завершения с таймаутом 60 секунд
-            timeout = 60
+            # Ждем 5 секунд чтобы Xray запустился
+            time.sleep(5)
+
+            # Быстрая проверка SOCKS5 прокси
+            self.log_message.emit(f"  ├─ Быстрая проверка SOCKS5 прокси...")
+            try:
+                import subprocess
+                quick_test = subprocess.run(
+                    ["curl", "--socks5", "127.0.0.1:3080", "--connect-timeout", "10", "--max-time", "15", "http://cp.cloudflare.com/"],
+                    capture_output=True,
+                    timeout=20,
+                    text=True
+                )
+                if quick_test.returncode != 0:
+                    self.log_message.emit(f"  └─ ⚠ SOCKS5 прокси не отвечает, пропускаю speedtest")
+                    result['error'] = "SOCKS5 прокси не работает"
+                    self.test_worker.stop()
+                    return result
+                else:
+                    self.log_message.emit(f"  ├─ ✓ SOCKS5 работает, запускаю speedtest...")
+            except Exception as e:
+                self.log_message.emit(f"  ├─ ⚠ Ошибка проверки прокси: {e}, продолжаю speedtest...")
+
+            # Ждем завершения с увеличенным таймаутом (2 минуты)
+            timeout = 120
             start_time = time.time()
+            last_log_time = start_time
+
             while not test_finished[0] and time.time() - start_time < timeout:
                 if not self._is_running:
                     self.test_worker.stop()
                     break
+
+                # Показываем прогресс каждые 15 секунд
+                elapsed = time.time() - start_time
+                if elapsed - (last_log_time - start_time) >= 15:
+                    self.log_message.emit(f"  │  ⏳ Ожидание: {int(elapsed)}с / {timeout}с")
+                    last_log_time = time.time()
+
                 time.sleep(0.5)
 
             # Останавливаем тест
+            self.log_message.emit(f"  ├─ Останавливаю тест...")
             self.test_worker.stop()
             test_thread.join(timeout=3)
 
@@ -2620,17 +2660,18 @@ class AutoTestWorker(QObject):
                 result['upload'] = stats.get('upload', 0)
 
                 if result['success']:
-                    self.log_message.emit(f"✅ Успех! Ping: {result['ping']}ms, ↓{result['download']}Mbps, ↑{result['upload']}Mbps")
+                    self.log_message.emit(f"  └─ ✅ Успех! Ping: {result['ping']}ms, ↓{result['download']}Mbps, ↑{result['upload']}Mbps")
                 else:
                     result['error'] = "Тест не прошел"
-                    self.log_message.emit(f"❌ Тест не прошел")
+                    self.log_message.emit(f"  └─ ❌ Тест не прошел")
             else:
-                result['error'] = "Таймаут теста"
-                self.log_message.emit(f"⏱ Таймаут теста (60 сек)")
+                elapsed = int(time.time() - start_time)
+                result['error'] = f"Таймаут теста ({elapsed}с)"
+                self.log_message.emit(f"  └─ ⏱ Таймаут теста ({elapsed}с из {timeout}с)")
 
         except Exception as e:
             result['error'] = str(e)
-            self.log_message.emit(f"❌ Ошибка теста: {e}")
+            self.log_message.emit(f"  └─ ❌ Ошибка теста: {e}")
 
         return result
 
