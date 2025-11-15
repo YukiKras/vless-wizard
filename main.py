@@ -2601,33 +2601,38 @@ class AutoTestWorker(QObject):
             self.test_worker.log_message.connect(on_log)
             self.test_worker.test_completed.connect(on_completed)
 
-            self.log_message.emit(f"  ├─ Запускаю Xray и жду инициализации...")
+            self.log_message.emit(f"  ├─ Запускаю Xray...")
             # Запускаем тест в отдельном потоке
             test_thread = threading.Thread(target=self.test_worker.run_test, daemon=True)
             test_thread.start()
 
-            # Ждем 5 секунд чтобы Xray запустился
-            time.sleep(5)
+            # Ждем пока SOCKS5 прокси поднимется (проверяем каждую секунду)
+            self.log_message.emit(f"  ├─ Жду запуска SOCKS5 прокси на порту 3080...")
+            socks_ready = False
+            for i in range(20):  # Ждем до 20 секунд
+                time.sleep(1)
+                try:
+                    import socket
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1)
+                    conn_result = sock.connect_ex(('127.0.0.1', 3080))
+                    sock.close()
+                    if conn_result == 0:
+                        socks_ready = True
+                        self.log_message.emit(f"  ├─ ✓ SOCKS5 прокси готов (через {i+1}с)")
+                        break
+                except Exception:
+                    pass
 
-            # Быстрая проверка SOCKS5 прокси
-            self.log_message.emit(f"  ├─ Быстрая проверка SOCKS5 прокси...")
-            try:
-                import subprocess
-                quick_test = subprocess.run(
-                    ["curl", "--socks5", "127.0.0.1:3080", "--connect-timeout", "10", "--max-time", "15", "http://cp.cloudflare.com/"],
-                    capture_output=True,
-                    timeout=20,
-                    text=True
-                )
-                if quick_test.returncode != 0:
-                    self.log_message.emit(f"  └─ ⚠ SOCKS5 прокси не отвечает, пропускаю speedtest")
-                    result['error'] = "SOCKS5 прокси не работает"
-                    self.test_worker.stop()
-                    return result
-                else:
-                    self.log_message.emit(f"  ├─ ✓ SOCKS5 работает, запускаю speedtest...")
-            except Exception as e:
-                self.log_message.emit(f"  ├─ ⚠ Ошибка проверки прокси: {e}, продолжаю speedtest...")
+            if not socks_ready:
+                self.log_message.emit(f"  └─ ⚠ SOCKS5 прокси не поднялся за 20 секунд")
+                result['error'] = "SOCKS5 прокси не запустился"
+                self.test_worker.stop()
+                return result
+
+            # Дополнительная пауза для стабилизации соединения
+            time.sleep(3)
+            self.log_message.emit(f"  ├─ Запускаю speedtest...")
 
             # Ждем завершения с увеличенным таймаутом (2 минуты)
             timeout = 120
