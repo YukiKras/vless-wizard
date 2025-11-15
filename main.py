@@ -2345,6 +2345,16 @@ class AutoTestWorker(QObject):
             self.log_message.emit(f"{'='*60}")
             self._analyze_and_finish()
 
+    def _clean_json_response(self, response):
+        """Очистка JSON ответа от мусора"""
+        cleaned = response.strip()
+        start_idx = cleaned.find('{')
+        end_idx = cleaned.rfind('}') + 1
+
+        if start_idx != -1 and end_idx != -1:
+            return cleaned[start_idx:end_idx]
+        return cleaned
+
     def _check_existing_inbound(self):
         """Проверка существующего inbound reality-443-auto"""
         try:
@@ -2355,8 +2365,8 @@ class AutoTestWorker(QObject):
             cmd = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/inbound/list"'
             exit_code, out, err = self.ssh_mgr.exec_command(cmd)
 
-            # Очистка вывода от ANSI кодов
-            cleaned = re.sub(r'\x1b\[[0-9;]*m', '', out)
+            # Очистка вывода
+            cleaned = self._clean_json_response(out)
             result = json.loads(cleaned)
 
             if result.get('success') and result.get('obj'):
@@ -2374,21 +2384,29 @@ class AutoTestWorker(QObject):
             self.log_message.emit(f"⚠ Ошибка проверки inbound: {e}")
 
     def _get_keys(self):
-        """Генерация ключей через xray"""
+        """Генерация ключей через API панели"""
         try:
-            cmd = 'x-ui 2>&1 <<EOF\n18\nEOF'
-            exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=15)
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
 
-            private_key = None
-            public_key = None
+            cmd_get_keys = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/server/getNewX25519Cert" -H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" -H "X-Requested-With: XMLHttpRequest"'
 
-            for line in out.splitlines():
-                if 'Private key:' in line or 'PrivateKey:' in line:
-                    private_key = line.split(':', 1)[1].strip()
-                elif 'Public key:' in line or 'PublicKey:' in line:
-                    public_key = line.split(':', 1)[1].strip()
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd_get_keys)
 
-            return private_key, public_key
+            if exit_code != 0:
+                raise Exception(f"Ошибка curl: {err}")
+
+            cleaned_out = self._clean_json_response(out)
+            keys_data = json.loads(cleaned_out)
+
+            if not keys_data.get('success'):
+                raise Exception(f"API ошибка: {keys_data.get('msg', 'Unknown error')}")
+
+            priv_key = keys_data['obj']['privateKey']
+            pub_key = keys_data['obj']['publicKey']
+
+            return priv_key, pub_key
 
         except Exception as e:
             self.log_message.emit(f"❌ Ошибка генерации ключей: {e}")
@@ -2489,7 +2507,7 @@ class AutoTestWorker(QObject):
                 )
 
             exit_code, out, err = self.ssh_mgr.exec_command(cmd)
-            cleaned = re.sub(r'\x1b\[[0-9;]*m', '', out)
+            cleaned = self._clean_json_response(out)
             result = json.loads(cleaned)
 
             if result.get('success'):
