@@ -2356,7 +2356,7 @@ class AutoTestWorker(QObject):
         return cleaned
 
     def _check_existing_inbound(self):
-        """Проверка существующего inbound reality-443-auto"""
+        """Проверка существующего inbound на порту 443"""
         try:
             base_url = self.panel_info['base_url']
             use_https = self.panel_info.get('use_https', False)
@@ -2365,20 +2365,36 @@ class AutoTestWorker(QObject):
             cmd = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/inbound/list"'
             exit_code, out, err = self.ssh_mgr.exec_command(cmd)
 
-            # Очистка вывода
-            cleaned = self._clean_json_response(out)
-            result = json.loads(cleaned)
+            # Более агрессивная очистка вывода
+            try:
+                cleaned = self._clean_json_response(out)
+                result = json.loads(cleaned)
+            except json.JSONDecodeError as e:
+                self.log_message.emit(f"⚠ Ошибка парсинга JSON, пробую альтернативный метод...")
+                # Пробуем найти JSON в выводе через regex
+                import re
+                match = re.search(r'\{.*\}', out, re.DOTALL)
+                if match:
+                    result = json.loads(match.group())
+                else:
+                    raise Exception(f"Не удалось найти JSON в ответе: {out[:200]}...")
 
             if result.get('success') and result.get('obj'):
+                # Ищем любой inbound на порту 443
                 for inbound in result['obj']:
-                    if inbound.get('remark') == 'reality443-auto':
+                    if inbound.get('port') == 443 or inbound.get('port') == '443':
                         self.current_inbound_id = inbound.get('id')
-                        settings = json.loads(inbound.get('settings', '{}'))
+                        settings_str = inbound.get('settings', '{}')
+                        if isinstance(settings_str, str):
+                            settings = json.loads(settings_str)
+                        else:
+                            settings = settings_str
                         self.existing_clients = settings.get('clients', [])
-                        self.log_message.emit(f"✓ Найден существующий inbound (ID: {self.current_inbound_id})")
+                        remark = inbound.get('remark', 'unknown')
+                        self.log_message.emit(f"✓ Найден inbound на порту 443 (ID: {self.current_inbound_id}, remark: {remark})")
                         return
 
-            self.log_message.emit("ℹ Существующий inbound не найден, будет создан новый")
+            self.log_message.emit("ℹ Inbound на порту 443 не найден, будет создан новый")
 
         except Exception as e:
             self.log_message.emit(f"⚠ Ошибка проверки inbound: {e}")
@@ -2516,7 +2532,29 @@ class AutoTestWorker(QObject):
                 self.log_message.emit(f"✓ Inbound обновлен с SNI: {sni}")
                 return True
             else:
-                self.log_message.emit(f"❌ API ошибка: {result.get('msg', 'Unknown')}")
+                error_msg = result.get('msg', 'Unknown')
+
+                # Если порт уже существует, но мы его не нашли - попробуем найти снова
+                if 'Port already exists' in error_msg or 'already exists' in error_msg:
+                    self.log_message.emit(f"⚠ Порт 443 занят, ищу существующий inbound...")
+                    self._check_existing_inbound()
+
+                    if self.current_inbound_id:
+                        # Нашли! Пробуем обновить
+                        cmd = (
+                            f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
+                            f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
+                            f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
+                        )
+                        exit_code2, out2, err2 = self.ssh_mgr.exec_command(cmd)
+                        cleaned2 = self._clean_json_response(out2)
+                        result2 = json.loads(cleaned2)
+
+                        if result2.get('success'):
+                            self.log_message.emit(f"✓ Inbound обновлен с SNI: {sni}")
+                            return True
+
+                self.log_message.emit(f"❌ API ошибка: {error_msg}")
                 return False
 
         except Exception as e:
