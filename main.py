@@ -2362,8 +2362,11 @@ class AutoTestWorker(QObject):
             use_https = self.panel_info.get('use_https', False)
             ssl_options = "-k" if use_https else ""
 
-            cmd = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/inbound/list"'
+            cmd = f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/list"'
             exit_code, out, err = self.ssh_mgr.exec_command(cmd)
+
+            if exit_code != 0:
+                raise Exception(f"Ошибка curl: {err}")
 
             # Более агрессивная очистка вывода
             try:
