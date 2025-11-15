@@ -2240,6 +2240,420 @@ class TestWorker(QObject):
         else:
             os.system('pkill -f xray 2>/dev/null')
 
+class AutoTestWorker(QObject):
+    """Воркер для автоматического тестирования всех SNI"""
+    log_message = Signal(str)
+    progress_update = Signal(int, int)  # current, total
+    result_ready = Signal(dict)  # результат одного теста
+    finished = Signal(dict)  # финальные результаты
+
+    def __init__(self, ssh_mgr, panel_info, cookie_jar, server_host, sni_list):
+        super().__init__()
+        self.ssh_mgr = ssh_mgr
+        self.panel_info = panel_info
+        self.cookie_jar = cookie_jar
+        self.server_host = server_host
+        self.sni_list = sni_list
+        self._is_running = False
+        self._is_paused = False
+        self.current_inbound_id = None
+        self.existing_clients = []
+        self.results = []
+        self.test_worker = None
+
+    def stop(self):
+        """Остановить тестирование"""
+        self._is_running = False
+        if self.test_worker:
+            self.test_worker.stop()
+
+    def pause(self):
+        """Поставить на паузу"""
+        self._is_paused = True
+        self.log_message.emit("⏸ Тестирование приостановлено")
+
+    def resume(self):
+        """Возобновить"""
+        self._is_paused = False
+        self.log_message.emit("▶ Тестирование возобновлено")
+
+    def run_auto_test(self):
+        """Основной цикл автоматического тестирования"""
+        self._is_running = True
+        self.results = []
+        total = len(self.sni_list)
+
+        self.log_message.emit(f"🚀 Начинаем автотестирование {total} SNI...")
+
+        # Проверяем существующий inbound
+        self._check_existing_inbound()
+
+        for index, sni in enumerate(self.sni_list):
+            if not self._is_running:
+                self.log_message.emit("❌ Тестирование остановлено пользователем")
+                break
+
+            # Проверка паузы
+            while self._is_paused and self._is_running:
+                time.sleep(0.5)
+
+            if not self._is_running:
+                break
+
+            current = index + 1
+            self.progress_update.emit(current, total)
+            self.log_message.emit(f"\n{'='*60}")
+            self.log_message.emit(f"📊 Тест {current}/{total}: {sni}")
+            self.log_message.emit(f"{'='*60}")
+
+            # Получаем ключи
+            priv_key, pub_key = self._get_keys()
+            if not priv_key or not pub_key:
+                self.log_message.emit(f"❌ Не удалось получить ключи для {sni}")
+                self._save_failed_result(sni, "Ошибка генерации ключей")
+                continue
+
+            # Обновляем inbound с новым SNI
+            success = self._update_inbound_with_sni(priv_key, pub_key, sni)
+            if not success:
+                self.log_message.emit(f"❌ Не удалось обновить inbound для {sni}")
+                self._save_failed_result(sni, "Ошибка обновления inbound")
+                continue
+
+            # Генерируем VLESS конфиг
+            client_id = self.existing_clients[0].get('id') if self.existing_clients else str(uuid.uuid4())
+            short_id = secrets.token_hex(8)
+            vless_config = f"vless://{client_id}@{self.server_host}:443?type=tcp&security=reality&sni={sni}&fp=chrome&pbk={pub_key}&sid={short_id}&flow=xtls-rprx-vision#autotest-{sni}"
+
+            self.log_message.emit(f"🔧 Конфиг сгенерирован, запускаем тест...")
+
+            # Запускаем speedtest
+            test_result = self._run_single_speedtest(vless_config, sni)
+
+            # Сохраняем результат
+            self._save_result(sni, test_result)
+
+            # Пауза между тестами
+            if current < total and self._is_running:
+                self.log_message.emit("⏳ Пауза 2 секунды...")
+                time.sleep(2)
+
+        # Завершение
+        if self._is_running:
+            self.log_message.emit(f"\n{'='*60}")
+            self.log_message.emit("✅ Автотестирование завершено!")
+            self.log_message.emit(f"{'='*60}")
+            self._analyze_and_finish()
+
+    def _check_existing_inbound(self):
+        """Проверка существующего inbound reality-443-auto"""
+        try:
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
+
+            cmd = f'curl -s {ssl_options} -b "{self.cookie_jar}" "{base_url}/panel/inbound/list"'
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd)
+
+            # Очистка вывода от ANSI кодов
+            cleaned = re.sub(r'\x1b\[[0-9;]*m', '', out)
+            result = json.loads(cleaned)
+
+            if result.get('success') and result.get('obj'):
+                for inbound in result['obj']:
+                    if inbound.get('remark') == 'reality443-auto':
+                        self.current_inbound_id = inbound.get('id')
+                        settings = json.loads(inbound.get('settings', '{}'))
+                        self.existing_clients = settings.get('clients', [])
+                        self.log_message.emit(f"✓ Найден существующий inbound (ID: {self.current_inbound_id})")
+                        return
+
+            self.log_message.emit("ℹ Существующий inbound не найден, будет создан новый")
+
+        except Exception as e:
+            self.log_message.emit(f"⚠ Ошибка проверки inbound: {e}")
+
+    def _get_keys(self):
+        """Генерация ключей через xray"""
+        try:
+            cmd = 'x-ui 2>&1 <<EOF\n18\nEOF'
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd, timeout=15)
+
+            private_key = None
+            public_key = None
+
+            for line in out.splitlines():
+                if 'Private key:' in line or 'PrivateKey:' in line:
+                    private_key = line.split(':', 1)[1].strip()
+                elif 'Public key:' in line or 'PublicKey:' in line:
+                    public_key = line.split(':', 1)[1].strip()
+
+            return private_key, public_key
+
+        except Exception as e:
+            self.log_message.emit(f"❌ Ошибка генерации ключей: {e}")
+            return None, None
+
+    def _update_inbound_with_sni(self, priv_key, pub_key, sni):
+        """Обновление inbound с новым SNI"""
+        try:
+            base_url = self.panel_info['base_url']
+            use_https = self.panel_info.get('use_https', False)
+            ssl_options = "-k" if use_https else ""
+            short_id = secrets.token_hex(8)
+
+            if self.existing_clients:
+                client_id = self.existing_clients[0].get('id', str(uuid.uuid4()))
+                settings = {
+                    "clients": self.existing_clients,
+                    "decryption": "none",
+                    "fallbacks": []
+                }
+            else:
+                client_id = str(uuid.uuid4())
+                settings = {
+                    "clients": [
+                        {
+                            "id": client_id,
+                            "flow": "xtls-rprx-vision",
+                            "email": f"autotest-{secrets.token_hex(4)}",
+                            "limitIp": 0,
+                            "totalGB": 0,
+                            "expiryTime": 0,
+                            "enable": True,
+                            "tgId": "",
+                            "subId": secrets.token_hex(16),
+                            "comment": "",
+                            "reset": 0
+                        }
+                    ],
+                    "decryption": "none",
+                    "fallbacks": []
+                }
+                self.existing_clients = settings["clients"]
+
+            stream_settings = {
+                "network": "tcp",
+                "security": "reality",
+                "externalProxy": [],
+                "realitySettings": {
+                    "show": False,
+                    "xver": 0,
+                    "dest": f"{sni}:443",
+                    "serverNames": [sni],
+                    "privateKey": priv_key,
+                    "minClientVer": "",
+                    "maxClientVer": "",
+                    "maxTimediff": 0,
+                    "shortIds": [short_id],
+                    "mldsa65Seed": "",
+                    "settings": {
+                        "publicKey": pub_key,
+                        "fingerprint": "chrome",
+                        "serverName": "",
+                        "spiderX": "/",
+                        "mldsa65Verify": ""
+                    }
+                },
+                "tcpSettings": {
+                    "acceptProxyProtocol": False,
+                    "header": {"type": "none"}
+                }
+            }
+
+            sniffing = {
+                "enabled": True,
+                "destOverride": ["http", "tls"],
+                "metadataOnly": False,
+                "routeOnly": False
+            }
+
+            from urllib.parse import quote_plus
+            settings_enc = quote_plus(json.dumps(settings, indent=2))
+            stream_enc = quote_plus(json.dumps(stream_settings, indent=2))
+            sniffing_enc = quote_plus(json.dumps(sniffing, indent=2))
+
+            if self.current_inbound_id:
+                # Обновляем существующий
+                cmd = (
+                    f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/update/{self.current_inbound_id}" -d '
+                    f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
+                    f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
+                )
+            else:
+                # Создаем новый
+                cmd = (
+                    f'curl -s {ssl_options} -b "{self.cookie_jar}" -X POST "{base_url}/panel/inbound/add" -d '
+                    f'"up=0&down=0&total=0&remark=reality443-auto&enable=true&expiryTime=0&listen=&port=443&protocol=vless&'
+                    f'settings={settings_enc}&streamSettings={stream_enc}&sniffing={sniffing_enc}"'
+                )
+
+            exit_code, out, err = self.ssh_mgr.exec_command(cmd)
+            cleaned = re.sub(r'\x1b\[[0-9;]*m', '', out)
+            result = json.loads(cleaned)
+
+            if result.get('success'):
+                if not self.current_inbound_id:
+                    self.current_inbound_id = result.get('obj', {}).get('id')
+                self.log_message.emit(f"✓ Inbound обновлен с SNI: {sni}")
+                return True
+            else:
+                self.log_message.emit(f"❌ API ошибка: {result.get('msg', 'Unknown')}")
+                return False
+
+        except Exception as e:
+            self.log_message.emit(f"❌ Ошибка обновления inbound: {e}")
+            return False
+
+    def _run_single_speedtest(self, vless_config, sni):
+        """Запуск одного speedtest"""
+        result = {
+            'sni': sni,
+            'dest': f"{sni}:443",
+            'success': False,
+            'ping': 0,
+            'download': 0,
+            'upload': 0,
+            'error': None,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+
+        try:
+            # Создаем test worker
+            self.test_worker = TestWorker(vless_config, "speed")
+
+            # Запускаем в отдельном потоке
+            test_finished = [False]
+            test_stats = [{}]
+
+            def on_log(msg):
+                self.log_message.emit(f"  └─ {msg}")
+
+            def on_completed(stats):
+                test_stats[0] = stats
+                test_finished[0] = True
+
+            self.test_worker.log_message.connect(on_log)
+            self.test_worker.test_completed.connect(on_completed)
+
+            # Запускаем тест в отдельном потоке
+            test_thread = threading.Thread(target=self.test_worker.run_test, daemon=True)
+            test_thread.start()
+
+            # Ждем завершения с таймаутом 60 секунд
+            timeout = 60
+            start_time = time.time()
+            while not test_finished[0] and time.time() - start_time < timeout:
+                if not self._is_running:
+                    self.test_worker.stop()
+                    break
+                time.sleep(0.5)
+
+            # Останавливаем тест
+            self.test_worker.stop()
+            test_thread.join(timeout=3)
+
+            if test_finished[0] and test_stats[0]:
+                stats = test_stats[0]
+                result['success'] = stats.get('success', False)
+                result['ping'] = stats.get('ping', 0)
+                result['download'] = stats.get('download', 0)
+                result['upload'] = stats.get('upload', 0)
+
+                if result['success']:
+                    self.log_message.emit(f"✅ Успех! Ping: {result['ping']}ms, ↓{result['download']}Mbps, ↑{result['upload']}Mbps")
+                else:
+                    result['error'] = "Тест не прошел"
+                    self.log_message.emit(f"❌ Тест не прошел")
+            else:
+                result['error'] = "Таймаут теста"
+                self.log_message.emit(f"⏱ Таймаут теста (60 сек)")
+
+        except Exception as e:
+            result['error'] = str(e)
+            self.log_message.emit(f"❌ Ошибка теста: {e}")
+
+        return result
+
+    def _save_result(self, sni, test_result):
+        """Сохранение результата одного теста"""
+        self.results.append(test_result)
+        self.result_ready.emit(test_result)
+
+    def _save_failed_result(self, sni, error):
+        """Сохранение неудачного результата"""
+        result = {
+            'sni': sni,
+            'dest': f"{sni}:443",
+            'success': False,
+            'ping': 0,
+            'download': 0,
+            'upload': 0,
+            'error': error,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        self._save_result(sni, result)
+
+    def _analyze_and_finish(self):
+        """Анализ результатов и завершение"""
+        successful = [r for r in self.results if r['success']]
+        failed = [r for r in self.results if not r['success']]
+
+        self.log_message.emit(f"\n📈 СТАТИСТИКА:")
+        self.log_message.emit(f"  Всего протестировано: {len(self.results)}")
+        self.log_message.emit(f"  Успешных: {len(successful)}")
+        self.log_message.emit(f"  Неудачных: {len(failed)}")
+
+        if successful:
+            # Находим лучшие
+            best_ping = min(successful, key=lambda x: x['ping'] if x['ping'] > 0 else float('inf'))
+            best_download = max(successful, key=lambda x: x['download'])
+            best_upload = max(successful, key=lambda x: x['upload'])
+
+            # Общий score
+            def calc_score(r):
+                return (r['download'] * 0.6) + (r['upload'] * 0.3) - (r['ping'] * 0.01)
+
+            best_overall = max(successful, key=calc_score)
+
+            self.log_message.emit(f"\n🏆 ЛУЧШИЕ РЕЗУЛЬТАТЫ:")
+            self.log_message.emit(f"  Лучший общий: {best_overall['sni']} (Score: {calc_score(best_overall):.2f})")
+            self.log_message.emit(f"    ├─ Ping: {best_overall['ping']}ms")
+            self.log_message.emit(f"    ├─ Download: {best_overall['download']}Mbps")
+            self.log_message.emit(f"    └─ Upload: {best_overall['upload']}Mbps")
+
+            self.log_message.emit(f"\n  Лучший ping: {best_ping['sni']} ({best_ping['ping']}ms)")
+            self.log_message.emit(f"  Лучший download: {best_download['sni']} ({best_download['download']}Mbps)")
+            self.log_message.emit(f"  Лучший upload: {best_upload['sni']} ({best_upload['upload']}Mbps)")
+
+            final_data = {
+                'test_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'server': self.server_host,
+                'total_tested': len(self.results),
+                'successful': len(successful),
+                'failed': len(failed),
+                'results': self.results,
+                'best_results': {
+                    'best_overall': best_overall,
+                    'best_ping': best_ping,
+                    'best_download': best_download,
+                    'best_upload': best_upload
+                }
+            }
+        else:
+            self.log_message.emit(f"\n⚠ Нет успешных результатов")
+            final_data = {
+                'test_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'server': self.server_host,
+                'total_tested': len(self.results),
+                'successful': 0,
+                'failed': len(failed),
+                'results': self.results,
+                'best_results': None
+            }
+
+        self.finished.emit(final_data)
+
 class PageInbound(BaseWizardPage):
     test_log_signal = Signal(str)
     test_completed_signal = Signal(dict)
@@ -3275,6 +3689,334 @@ def check_for_update(parent=None):
         print(f"[update] Ошибка проверки обновлений: {e}")
     return False
 
+class PageAutoTest(BaseWizardPage):
+    """Страница автоматического тестирования всех SNI"""
+
+    def __init__(self, ssh_mgr: SSHManager, logger_sig: LoggerSignal, log_window: LogWindow, sni_manager: SNIManager, page_auth):
+        super().__init__(ssh_mgr, logger_sig, log_window, sni_manager)
+        self.page_auth = page_auth
+        self.setTitle("Шаг 6 — Автоподбор лучшего DEST")
+        self.setSubTitle("Автоматическое тестирование всех SNI и выбор лучшего")
+
+        self.auto_test_worker = None
+        self.auto_test_thread = None
+        self.test_results = []
+
+        layout = QVBoxLayout()
+
+        # Информация
+        info_label = QLabel(
+            "Программа автоматически протестирует все доступные SNI (dest) и выберет лучший по скорости.\n"
+            "Процесс может занять от 30 минут до нескольких часов в зависимости от количества SNI."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Настройки теста
+        settings_group = QGroupBox("Настройки тестирования")
+        settings_layout = QVBoxLayout()
+
+        # Выбор количества SNI для теста
+        count_layout = QHBoxLayout()
+        count_layout.addWidget(QLabel("Количество SNI для теста:"))
+        self.sni_count_combo = QComboBox()
+        self.sni_count_combo.addItems(["Первые 10 (быстро)", "Первые 50", "Первые 100", "Все SNI (долго)"])
+        self.sni_count_combo.setCurrentIndex(1)
+        count_layout.addWidget(self.sni_count_combo)
+        count_layout.addStretch()
+        settings_layout.addLayout(count_layout)
+
+        settings_group.setLayout(settings_layout)
+        layout.addWidget(settings_group)
+
+        # Прогресс
+        progress_group = QGroupBox("Прогресс")
+        progress_layout = QVBoxLayout()
+
+        self.status_label = QLabel("Готово к запуску")
+        progress_layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("%v / %m (%p%)")
+        progress_layout.addWidget(self.progress_bar)
+
+        progress_group.setLayout(progress_layout)
+        layout.addWidget(progress_group)
+
+        # Кнопки управления
+        btn_layout = QHBoxLayout()
+        self.start_btn = QPushButton("▶ Начать тестирование")
+        self.start_btn.clicked.connect(self.start_auto_test)
+        self.start_btn.setStyleSheet("QPushButton { background-color: #28a745; color: white; font-weight: bold; padding: 8px; }")
+
+        self.pause_btn = QPushButton("⏸ Пауза")
+        self.pause_btn.clicked.connect(self.pause_auto_test)
+        self.pause_btn.setEnabled(False)
+
+        self.stop_btn = QPushButton("⏹ Остановить")
+        self.stop_btn.clicked.connect(self.stop_auto_test)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet("QPushButton { background-color: #dc3545; color: white; }")
+
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.pause_btn)
+        btn_layout.addWidget(self.stop_btn)
+        layout.addLayout(btn_layout)
+
+        # Лучшие результаты
+        results_group = QGroupBox("🏆 Лучшие результаты")
+        results_layout = QVBoxLayout()
+
+        self.best_results_text = QPlainTextEdit()
+        self.best_results_text.setReadOnly(True)
+        self.best_results_text.setMaximumHeight(150)
+        self.best_results_text.setPlainText("Результаты появятся после завершения тестирования")
+        results_layout.addWidget(self.best_results_text)
+
+        # Кнопки для результатов
+        results_btn_layout = QHBoxLayout()
+        self.save_json_btn = QPushButton("💾 Сохранить результаты в JSON")
+        self.save_json_btn.clicked.connect(self.save_results_to_json)
+        self.save_json_btn.setEnabled(False)
+
+        self.apply_best_btn = QPushButton("✅ Применить лучший SNI")
+        self.apply_best_btn.clicked.connect(self.apply_best_sni)
+        self.apply_best_btn.setEnabled(False)
+        self.apply_best_btn.setStyleSheet("QPushButton { background-color: #007bff; color: white; font-weight: bold; }")
+
+        results_btn_layout.addWidget(self.save_json_btn)
+        results_btn_layout.addWidget(self.apply_best_btn)
+        results_layout.addLayout(results_btn_layout)
+
+        results_group.setLayout(results_layout)
+        layout.addWidget(results_group)
+
+        # Лог
+        log_group = QGroupBox("Лог тестирования")
+        log_layout = QVBoxLayout()
+
+        self.test_log = QPlainTextEdit()
+        self.test_log.setReadOnly(True)
+        self.test_log.setMaximumHeight(200)
+        log_layout.addWidget(self.test_log)
+
+        log_group.setLayout(log_layout)
+        layout.addWidget(log_group)
+
+        layout.addStretch()
+        self.setLayout(layout)
+
+        self.final_results = None
+
+    def initializePage(self):
+        """Инициализация страницы при входе"""
+        self.panel_info = self.page_auth.get_panel_info()
+        self.cookie_jar = self.panel_info.get('cookie_jar', '')
+
+        # Получаем IP сервера
+        if self.ssh_mgr.client:
+            transport = self.ssh_mgr.client.get_transport()
+            if transport:
+                self.server_host = transport.getpeername()[0]
+            else:
+                self.server_host = "127.0.0.1"
+        else:
+            self.server_host = "127.0.0.1"
+
+        # Загружаем список SNI
+        self.sni_manager.load_available_sni()
+        total_sni = self.sni_manager.get_total_count()
+        self.test_log.appendPlainText(f"Доступно {total_sni} SNI для тестирования")
+
+    def get_sni_list_for_test(self):
+        """Получить список SNI для теста в зависимости от выбора"""
+        all_sni = self.sni_manager.available_sni
+        selected = self.sni_count_combo.currentIndex()
+
+        if selected == 0:  # Первые 10
+            return all_sni[:10]
+        elif selected == 1:  # Первые 50
+            return all_sni[:50]
+        elif selected == 2:  # Первые 100
+            return all_sni[:100]
+        else:  # Все
+            return all_sni
+
+    def start_auto_test(self):
+        """Запуск автоматического тестирования"""
+        sni_list = self.get_sni_list_for_test()
+
+        if not sni_list:
+            QMessageBox.warning(self, "Ошибка", "Нет доступных SNI для тестирования")
+            return
+
+        # Подтверждение
+        total = len(sni_list)
+        estimated_time = total * 1  # ~1 минута на SNI
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Подтверждение")
+        msg.setText(f"Начать тестирование {total} SNI?")
+        msg.setInformativeText(f"Примерное время: {estimated_time} минут\n\nВы можете остановить тестирование в любой момент.")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+
+        if msg.exec() != QMessageBox.Yes:
+            return
+
+        # Очищаем предыдущие результаты
+        self.test_results = []
+        self.final_results = None
+        self.test_log.clear()
+        self.best_results_text.setPlainText("Тестирование в процессе...")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(0)
+
+        # Создаем воркер
+        self.auto_test_worker = AutoTestWorker(
+            self.ssh_mgr,
+            self.panel_info,
+            self.cookie_jar,
+            self.server_host,
+            sni_list
+        )
+
+        # Создаем поток
+        self.auto_test_thread = QThread()
+        self.auto_test_worker.moveToThread(self.auto_test_thread)
+
+        # Подключаем сигналы
+        self.auto_test_thread.started.connect(self.auto_test_worker.run_auto_test)
+        self.auto_test_worker.log_message.connect(self.on_test_log)
+        self.auto_test_worker.progress_update.connect(self.on_progress_update)
+        self.auto_test_worker.result_ready.connect(self.on_result_ready)
+        self.auto_test_worker.finished.connect(self.on_test_finished)
+        self.auto_test_worker.finished.connect(self.auto_test_thread.quit)
+        self.auto_test_worker.finished.connect(self.auto_test_worker.deleteLater)
+        self.auto_test_thread.finished.connect(self.auto_test_thread.deleteLater)
+
+        # Обновляем UI
+        self.start_btn.setEnabled(False)
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+        self.save_json_btn.setEnabled(False)
+        self.apply_best_btn.setEnabled(False)
+        self.sni_count_combo.setEnabled(False)
+
+        # Запускаем поток
+        self.auto_test_thread.start()
+        self.status_label.setText("🚀 Тестирование запущено...")
+
+    def pause_auto_test(self):
+        """Пауза тестирования"""
+        if self.auto_test_worker:
+            if self.auto_test_worker._is_paused:
+                self.auto_test_worker.resume()
+                self.pause_btn.setText("⏸ Пауза")
+                self.status_label.setText("▶ Тестирование продолжено")
+            else:
+                self.auto_test_worker.pause()
+                self.pause_btn.setText("▶ Продолжить")
+                self.status_label.setText("⏸ Тестирование на паузе")
+
+    def stop_auto_test(self):
+        """Остановка тестирования"""
+        if self.auto_test_worker:
+            self.auto_test_worker.stop()
+            self.status_label.setText("⏹ Остановка тестирования...")
+            self.stop_btn.setEnabled(False)
+
+    def on_test_log(self, message):
+        """Обработка лог-сообщений"""
+        self.test_log.appendPlainText(message)
+        self.test_log.verticalScrollBar().setValue(self.test_log.verticalScrollBar().maximum())
+
+    def on_progress_update(self, current, total):
+        """Обновление прогресса"""
+        self.progress_bar.setValue(current)
+        self.status_label.setText(f"📊 Тестируется: {current} из {total}")
+
+    def on_result_ready(self, result):
+        """Обработка готового результата одного теста"""
+        self.test_results.append(result)
+
+    def on_test_finished(self, final_data):
+        """Завершение тестирования"""
+        self.final_results = final_data
+
+        # Обновляем UI
+        self.start_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        self.sni_count_combo.setEnabled(True)
+
+        if self.auto_test_worker and self.auto_test_worker._is_paused:
+            self.pause_btn.setText("⏸ Пауза")
+
+        # Показываем результаты
+        if final_data.get('best_results'):
+            best = final_data['best_results']
+            best_overall = best['best_overall']
+
+            results_text = f"🏆 ЛУЧШИЙ ОБЩИЙ SNI: {best_overall['sni']}\n"
+            results_text += f"  ├─ Ping: {best_overall['ping']} ms\n"
+            results_text += f"  ├─ Download: {best_overall['download']} Mbps\n"
+            results_text += f"  └─ Upload: {best_overall['upload']} Mbps\n\n"
+
+            results_text += f"📊 Лучший ping: {best['best_ping']['sni']} ({best['best_ping']['ping']} ms)\n"
+            results_text += f"📊 Лучший download: {best['best_download']['sni']} ({best['best_download']['download']} Mbps)\n"
+            results_text += f"📊 Лучший upload: {best['best_upload']['sni']} ({best['best_upload']['upload']} Mbps)\n"
+
+            self.best_results_text.setPlainText(results_text)
+            self.save_json_btn.setEnabled(True)
+            self.apply_best_btn.setEnabled(True)
+            self.status_label.setText(f"✅ Тестирование завершено! Лучший SNI: {best_overall['sni']}")
+        else:
+            self.best_results_text.setPlainText("❌ Нет успешных результатов")
+            self.save_json_btn.setEnabled(True)
+            self.status_label.setText("⚠ Тестирование завершено без успешных результатов")
+
+    def save_results_to_json(self):
+        """Сохранение результатов в JSON файл"""
+        if not self.final_results:
+            QMessageBox.warning(self, "Ошибка", "Нет результатов для сохранения")
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить результаты",
+            f"autotest_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            "JSON Files (*.json)"
+        )
+
+        if file_path:
+            try:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.final_results, f, indent=2, ensure_ascii=False)
+                QMessageBox.information(self, "Успех", f"Результаты сохранены в:\n{file_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить файл:\n{e}")
+
+    def apply_best_sni(self):
+        """Применить лучший SNI и перейти к странице Inbound"""
+        if not self.final_results or not self.final_results.get('best_results'):
+            QMessageBox.warning(self, "Ошибка", "Нет лучшего SNI для применения")
+            return
+
+        best_sni = self.final_results['best_results']['best_overall']['sni']
+
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Применить лучший SNI")
+        msg.setText(f"Применить лучший SNI: {best_sni}?")
+        msg.setInformativeText("SNI будет установлен как приоритетный в настройках Vless")
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+
+        if msg.exec() == QMessageBox.Yes:
+            # Сохраняем лучший SNI для использования на странице Inbound
+            self.best_sni = best_sni
+            QMessageBox.information(self, "Успех", f"Лучший SNI ({best_sni}) будет использован в конфигурации")
+
 class XUIWizard(QWizard):
     def __init__(self):
         super().__init__()
@@ -3291,12 +4033,14 @@ class XUIWizard(QWizard):
         self.page_auth = PagePanelAuth(self.ssh_mgr, self.logger_sig, self.page_install, self.log_window, self.sni_manager)
         self.page_backup = PageBackupPanel(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager)
         self.page_inbound = PageInbound(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager, self.page_auth)
-        
+        self.page_autotest = PageAutoTest(self.ssh_mgr, self.logger_sig, self.log_window, self.sni_manager, self.page_auth)
+
         self.addPage(self.page_ssh)
         self.addPage(self.page_install)
         self.addPage(self.page_auth)
         self.addPage(self.page_backup)
         self.addPage(self.page_inbound)
+        self.addPage(self.page_autotest)
         
         self.setOption(QWizard.IndependentPages, False)
         self.setWizardStyle(QWizard.ModernStyle)
@@ -3328,6 +4072,8 @@ class XUIWizard(QWizard):
         try:
             if hasattr(self.page_inbound, 'stop_xray'):
                 self.page_inbound.stop_xray()
+            if hasattr(self.page_autotest, 'auto_test_worker') and self.page_autotest.auto_test_worker:
+                self.page_autotest.auto_test_worker.stop()
             self.ssh_mgr.close()
             self.log_window.close()
         except Exception:
